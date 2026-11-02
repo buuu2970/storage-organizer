@@ -46,6 +46,10 @@ class AppContext(QObject):
         # 初期学習用サンプル（全プロファイル共通。回答はこのプロファイルの db に保存する）
         self.samples_root = Path(samples_root) if samples_root else db.data_dir / "samples"
         self.samples = SampleStore(self.samples_root)
+        try:  # 同梱の12本（または指定済みのフォルダ）を自動で登録しておく
+            self.samples.ensure_registered()
+        except OSError:
+            pass  # 見つからなくても他の機能は使える（初期学習の画面で案内する）
         self.profile_name = profile_name
         self._thread: QThread | None = None
         self._worker: TaskWorker | None = None
@@ -2057,7 +2061,7 @@ class SettingsPage(BasePage):
         form.addRow("データ保存先", self.data_label)
         layout.addLayout(form)
         save = QPushButton("設定を保存")
-        reset = QPushButton("初期学習の状態をリセット（回答・教師データは残します）")
+        reset = QPushButton("初期学習をもう一度表示する（回答・教師データは残します）")
         model_reset = QPushButton("学習リセット（AIを選んで初期化）…")
         layout.addWidget(save)
         layout.addWidget(reset)

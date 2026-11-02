@@ -361,7 +361,16 @@ class MainWindow(QMainWindow):
         self.profile_combo.activated.connect(
             lambda i: self.switch_profile(self.profile_combo.itemData(i)))
         self.add_profile_button.clicked.connect(self.add_profile)
+        c.data_changed.connect(self._update_nav)
         self.nav.setCurrentRow(0)
+        self._update_nav()
+
+    def _update_nav(self) -> None:
+        """初期学習をスキップしたプロファイルではメニューから隠す（「設定」から再表示できる）。"""
+        hidden = self.ctx.db.initial_state() == "skipped"
+        self.nav.item(self.page_widgets.index(self.initial)).setHidden(hidden)
+        if hidden and self.stack.currentWidget() is self.initial:
+            self.show_page(self.dashboard)
 
     def show_page(self, widget) -> None:
         self.nav.setCurrentRow(self.page_widgets.index(widget))

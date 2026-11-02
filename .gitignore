@@ -218,6 +218,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
-# 初期学習用サンプル動画（容量が大きいためリポジトリに含めない）
-sample_videos/

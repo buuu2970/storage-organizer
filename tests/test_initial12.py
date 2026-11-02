@@ -33,7 +33,7 @@ RULE = ["ゲーム", "ゲーム", "授業・学習", "授業・学習", "音楽�
 
 try:
     from PySide6.QtCore import QCoreApplication, QEvent
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 except ImportError:
     QApplication = None
 
@@ -536,12 +536,35 @@ class InitialLearningGuiTest(unittest.TestCase):
 
     def test_skip_whole_initial_learning(self):  # 8
         w = self.window
+        item = w.nav.item(w.page_widgets.index(w.initial))
         w.show_page(w.initial)
+        self.assertFalse(item.isHidden())
         w.initial.skip_all_button.click()
         self.assertEqual(w.ctx.db.initial_state(), "skipped")
-        w.show_page(w.dashboard)
+        self.assertTrue(item.isHidden())  # スキップしたらメニューから消える
+        self.assertIs(w.stack.currentWidget(), w.dashboard)
         self.assertIn("精度は十分ではありません", w.dashboard.ai_label.text())
         self.assertIn("スキップ", w.dashboard.ai_label.text())
+        # 再起動しても隠れたまま
+        self._close(w)
+        self.window = w = self._new_window()
+        self.assertTrue(w.nav.item(w.page_widgets.index(w.initial)).isHidden())
+        # 「設定」から再表示できる
+        w.show_page(w.settings)
+        next(b for b in w.settings.findChildren(QPushButton) if "もう一度表示" in b.text()).click()
+        self.assertFalse(w.nav.item(w.page_widgets.index(w.initial)).isHidden())
+
+    def test_bundled_samples_registered_automatically(self):
+        bundled = samples.project_sample_dir()
+        if not bundled.is_dir() or len(samples.list_sample_files(str(bundled))[0]) != 12:
+            self.skipTest("同梱の12本がありません")
+        store = SampleStore(Path(self._data.name) / "fresh_samples")
+        try:
+            store.ensure_registered()
+            self.assertEqual(len(store.samples()), 12)
+            self.assertEqual(Path(store.sample_dir()), bundled)
+        finally:
+            store.close()
 
     def test_scan_does_not_register_samples(self):  # 14
         w = self.window
@@ -556,11 +579,11 @@ class InitialLearningGuiTest(unittest.TestCase):
     def test_missing_samples_show_error(self):
         empty_root = Path(self._data.name) / "empty_samples"
         self._close(self.window)
-        w = self.MainWindow(db=Database(Path(self._data.name) / "p2"), samples_root=empty_root)
-        w.ask_initial_learning = False
-        self.window = w
-        w.show()
         with mock.patch.object(SampleStore, "candidate_dirs", lambda self: []):
+            w = self.MainWindow(db=Database(Path(self._data.name) / "p2"), samples_root=empty_root)
+            w.ask_initial_learning = False
+            self.window = w
+            w.show()
             w.show_page(w.initial)
             w.initial.start()
         self.assertFalse(w.initial.step.isVisible())

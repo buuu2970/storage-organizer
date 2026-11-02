@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS settings (
 
 
 def project_sample_dir() -> Path:
-    """リポジトリ直下の sample_videos（開発者が12本を置く既定の場所）。"""
+    """リポジトリ直下の sample_videos（同梱の12本。起動時に自動で登録する）。"""
     return Path(__file__).resolve().parent.parent / "sample_videos"
 
 
@@ -176,8 +176,12 @@ class SampleStore:
         return [d for d in dirs if d]
 
     def ensure_registered(self) -> RegisterResult | None:
-        """未登録なら既定の場所から登録を試みる。登録済みなら状態だけ確認する。"""
-        if self.samples():
+        """未登録なら既定の場所から登録を試みる。登録済みなら状態だけ確認する。
+
+        登録したフォルダがなくなっていた場合（別のパソコンへ移したときなど）も既定の場所を探す。
+        """
+        current = self.sample_dir()
+        if self.samples() and current and Path(current).is_dir():
             return self.refresh()
         for d in self.candidate_dirs():
             if Path(d).is_dir():
@@ -187,7 +191,7 @@ class SampleStore:
                     continue
                 if result.count:
                     return result
-        return None
+        return self.refresh() if self.samples() else None
 
     # --- 登録・状態確認 -----------------------------------------------------
     def register_folder(self, folder: str) -> RegisterResult:
