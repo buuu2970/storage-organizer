@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>ストレージ整理 - 動画のお掃除</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div>
+    <h1>🗂 ストレージ整理 <small>v__VERSION__</small></h1>
+    <div class="sub">動画のお掃除：削除候補を確認して、チェックしたものをデスクトップの「削除予定」フォルダへ移動します（削除はご自身の手で行います）</div>
+  </div>
+  <button class="push" onclick="quitApp()">アプリを終了</button>
+</header>
+
+<main>
+  <section class="panel" id="setup">
+    <h2>① 調べるフォルダ</h2>
+    <div class="folders" id="folders"></div>
+    <div class="row">
+      <input type="text" id="newFolder" placeholder="フォルダのパスを追加（例: D:\録画）">
+      <button onclick="addFolder()">追加</button>
+    </div>
+    <div class="row gap-top">
+      <label><input type="checkbox" id="blur" checked> 映像のぼやけも調べる（精度↑・時間がかかる）</label>
+      <button class="push" id="rescanBtn" onclick="scan()" hidden>もう一度スキャン</button>
+      <button class="primary" id="mainBtn" onclick="mainAction()">スキャン開始</button>
+    </div>
+    <div id="prog" hidden>
+      <div class="progress"><div id="bar"></div></div>
+      <div class="meta" id="progText"></div>
+    </div>
+  </section>
+
+  <section class="panel notice" id="movedNotice" hidden>
+    <div id="movedText"></div>
+    <div class="row gap-top">
+      <button onclick="openPending()">📁 削除予定フォルダを開く</button>
+      <span class="meta">このアプリは動画を削除しません。フォルダの中身を確認し、不要な動画はご自身でごみ箱へ移動してください。</span>
+    </div>
+  </section>
+
+  <section id="result" hidden>
+    <div class="summary" id="summary"></div>
+    <div class="toolbar">
+      <span>絞り込み:</span><span id="chips"></span>
+      <label class="gap-left"><input type="checkbox" id="showOk" onchange="render()"> 問題なしの動画も表示</label>
+      <span class="push">並び順:</span>
+      <select id="sort" onchange="render()">
+        <option value="pri">推奨度が高い順</option>
+        <option value="size">サイズが大きい順</option>
+        <option value="dur">長さが短い順</option>
+        <option value="date">古い順</option>
+      </select>
+    </div>
+    <div class="toolbar">
+      <button onclick="selectWhere(i => i.priority === 3)">推奨度「高」をすべて選択</button>
+      <button onclick="selectVisible()">表示中をすべて選択</button>
+      <button onclick="clearSelection()">選択をすべて解除</button>
+    </div>
+    <div class="grid" id="grid"></div>
+  </section>
+</main>
+
+<footer id="footer" hidden>
+  <div class="info" id="selInfo"></div>
+  <button class="danger" id="footerMoveBtn" onclick="confirmMove()" disabled>削除予定に移動</button>
+</footer>
+
+<div class="modal" id="modal" hidden>
+  <div class="box">
+    <h2>削除予定フォルダへ移動しますか？</h2>
+    <div id="modalInfo"></div>
+    <ul id="modalList"></ul>
+    <div class="row end">
+      <button onclick="closeModal()">キャンセル</button>
+      <button class="danger" onclick="doMove()">削除予定に移動する</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast" hidden></div>
+
+<script>const TOKEN = "__TOKEN__";</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "storage-organizer"
+version = "0.1.0"
+description = "Windowsストレージ整理アプリ"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []  # 標準ライブラリのみ (外部ツールとして ffmpeg が必要)
+
+[project.scripts]
+storage-organizer = "storage_organizer.web.server:main"
+storage-organizer-cli = "storage_organizer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["storage_organizer*"]
+
+[tool.setuptools.package-data]
+"storage_organizer.web" = ["static/*"]
