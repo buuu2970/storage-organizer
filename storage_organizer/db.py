@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 DEFAULT_GENRES = [
@@ -29,6 +31,17 @@ CURATION_CHOICES = ("残す", "整理候補", "保留")
 TRAINABLE_CHOICES = ("残す", "整理候補")  # 「保留」は教師データに使わない
 CLASSIFY_SCOPE = "classify"  # ジャンル分類AI
 CURATE_ALL_SCOPE = "curate_all"  # 全動画厳選AI
+# 初期12本の回答状態（「未回答」は行を持たない）
+UNANSWERED, ANSWERED, SKIPPED = "未回答", "回答済み", "スキップ"
+# 初期学習の進捗（settings の initial_state。None = 未実施）
+INITIAL_STATES = {None: "未実施", "in_progress": "途中", "done": "完了", "skipped": "スキップ"}
+RESERVED_GENRE_NAMES = ("未分類",)  # 未分類は分類状態であり、ジャンルとして作らない
+
+
+def normalize_genre_name(name: str) -> str:
+    """重複確認用の正規化（全角半角・大文字小文字・空白や区切り記号の違いを無視）。"""
+    s = unicodedata.normalize("NFKC", name).lower()
+    return re.sub(r"[\s・･/,、。.\-‐−_&＆]+", "", s)
 
 
 def curate_genre_scope(genre_id: int) -> str:
@@ -114,6 +127,27 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+-- 初期12本（共通サンプル）への回答。動画本体やパスは持たず、サンプル ID で参照する
+CREATE TABLE IF NOT EXISTS sample_answers (
+    sample_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,          -- 回答済み / スキップ
+    content_hash TEXT,             -- 回答したときの動画の簡易ハッシュ（入れ替わり検出用）
+    updated_at REAL NOT NULL,
+    model_version INTEGER          -- NULL = まだ学習に反映していない
+);
+CREATE TABLE IF NOT EXISTS sample_answer_genres (
+    sample_id TEXT NOT NULL REFERENCES sample_answers(sample_id) ON DELETE CASCADE,
+    genre_id INTEGER NOT NULL REFERENCES genres(id) ON DELETE CASCADE,
+    PRIMARY KEY (sample_id, genre_id)
+);
+CREATE TABLE IF NOT EXISTS sample_answer_history (
+    id INTEGER PRIMARY KEY,
+    sample_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    genre_ids TEXT,                -- JSON
+    content_hash TEXT,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -157,6 +191,9 @@ class Database:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(models)")}
         if "scope" not in cols:
             self.conn.execute(f"ALTER TABLE models ADD COLUMN scope TEXT NOT NULL DEFAULT '{CLASSIFY_SCOPE}'")
+        if "ai_rejected" not in {r[1] for r in self.conn.execute("PRAGMA table_info(videos)")}:
+            # ユーザーが却下した AI のジャンル提案（JSON: ジャンルID の配列）
+            self.conn.execute("ALTER TABLE videos ADD COLUMN ai_rejected TEXT")
         # 以前の厳選結果（videos.curation）は全動画厳選の回答として1回だけ引き継ぐ
         if self.conn.execute("SELECT value FROM settings WHERE key='curation_migrated'").fetchone() is None:
             now = time.time()
@@ -230,7 +267,7 @@ class Database:
         self.conn.execute(
             "UPDATE videos SET size=?, mtime=?, analysis_state='未解析', analysis_error=NULL, "
             "meta=NULL, features=NULL, thumbs=NULL, sha256=NULL, ai_state='未判定', "
-            "ai_genres=NULL, ai_candidates=NULL, ai_reason=NULL, ai_model_version=NULL "
+            "ai_genres=NULL, ai_candidates=NULL, ai_reason=NULL, ai_model_version=NULL, ai_rejected=NULL "
             "WHERE id=?", (size, mtime, video_id))
         self.conn.execute("DELETE FROM video_tags WHERE video_id=? AND source='ai'", (video_id,))
 
@@ -269,6 +306,19 @@ class Database:
                 fields[key] = json.dumps(fields[key], ensure_ascii=False)
         cols = ", ".join(f"{k}=?" for k in fields)
         self.conn.execute(f"UPDATE videos SET {cols} WHERE id=?", (*fields.values(), video_id))
+        self.conn.commit()
+
+    def rejected_ai_genres(self, video_id: int) -> set[int]:
+        return set(loads(self.video(video_id)["ai_rejected"], []))
+
+    def reject_ai_genres(self, video_id: int) -> None:
+        """AI のジャンル提案を却下する。却下したジャンルは同じ動画に再提案しない（教師データにはしない）。"""
+        row = self.video(video_id)
+        rejected = set(loads(row["ai_rejected"], [])) | {e["genre_id"] for e in loads(row["ai_genres"], [])}
+        self.conn.execute(
+            "UPDATE videos SET ai_rejected=?, ai_state='未分類', ai_genres='[]', "
+            "ai_reason='AIの提案をユーザーが却下しました' WHERE id=?",
+            (json.dumps(sorted(rejected)), video_id))
         self.conn.commit()
 
     # --- 厳選の回答（教師データ） ---------------------------------------------
@@ -365,19 +415,29 @@ class Database:
     def genre_names(self) -> dict[int, str]:
         return {g["id"]: g["name"] for g in self.genres()}
 
-    def add_genre(self, name: str) -> int:
+    def _check_genre_name(self, name: str, genre_id: int | None = None) -> str:
         name = name.strip()
         if not name:
             raise ValueError("ジャンル名が空です")
+        key = normalize_genre_name(name)
+        if not key:
+            raise ValueError("ジャンル名に文字を入れてください")
+        if key in {normalize_genre_name(r) for r in RESERVED_GENRE_NAMES}:
+            raise ValueError("「未分類」は分類状態を表す言葉のため、ジャンル名には使えません")
+        for g in self.genres():
+            if g["id"] != genre_id and normalize_genre_name(g["name"]) == key:
+                raise ValueError(f"「{g['name']}」と同じジャンルがあります")
+        return name
+
+    def add_genre(self, name: str) -> int:
+        name = self._check_genre_name(name)
         sort = self.conn.execute("SELECT COALESCE(MAX(sort),0)+1 FROM genres").fetchone()[0]
         cur = self.conn.execute("INSERT INTO genres(name, sort) VALUES (?,?)", (name, sort))
         self.conn.commit()
         return cur.lastrowid
 
     def rename_genre(self, genre_id: int, name: str) -> None:
-        name = name.strip()
-        if not name:
-            raise ValueError("ジャンル名が空です")
+        name = self._check_genre_name(name, genre_id)
         self.conn.execute("UPDATE genres SET name=? WHERE id=?", (name, genre_id))
         self.conn.commit()
 
@@ -492,8 +552,11 @@ class Database:
         return self.conn.execute("SELECT * FROM training ORDER BY labeled_at").fetchall()
 
     def pending_training_count(self) -> int:
+        """まだ学習に反映していない教師データ（通常の動画＋初期12本の回答）。"""
         return self.conn.execute(
-            "SELECT COUNT(*) FROM training WHERE model_version IS NULL").fetchone()[0]
+            "SELECT (SELECT COUNT(*) FROM training WHERE model_version IS NULL) + "
+            f"(SELECT COUNT(*) FROM sample_answers WHERE status='{ANSWERED}' AND model_version IS NULL)"
+        ).fetchone()[0]
 
     def mark_training_applied(self, version: int, video_ids) -> None:
         self.conn.executemany("UPDATE training SET model_version=? WHERE video_id=?",
@@ -535,8 +598,70 @@ class Database:
             self.conn.execute("UPDATE videos SET ai_state='未判定', ai_genres=NULL, ai_candidates=NULL, "
                               "ai_reason=NULL, ai_model_version=NULL")
             self.conn.execute("UPDATE training SET model_version=NULL")
+            self.conn.execute("UPDATE sample_answers SET model_version=NULL")
         self.conn.commit()
         return versions
+
+    # --- 初期12本の回答（このプロファイル専用） ------------------------------------
+    def sample_answers(self) -> dict[str, dict]:
+        """{サンプルID: {"status", "genres", "content_hash", "updated_at", "model_version"}}"""
+        genres: dict[str, set[int]] = {}
+        for sid, gid in self.conn.execute("SELECT sample_id, genre_id FROM sample_answer_genres"):
+            genres.setdefault(sid, set()).add(gid)
+        return {r["sample_id"]: {"status": r["status"], "genres": genres.get(r["sample_id"], set()),
+                                 "content_hash": r["content_hash"], "updated_at": r["updated_at"],
+                                 "model_version": r["model_version"]}
+                for r in self.conn.execute("SELECT * FROM sample_answers")}
+
+    def sample_answer(self, sample_id: str) -> dict | None:
+        return self.sample_answers().get(sample_id)
+
+    def save_sample_answer(self, sample_id: str, status: str, genre_ids=(),
+                           content_hash: str | None = None) -> bool:
+        """初期12本の回答を保存する。回答済みはジャンル1つ以上が必要。変更があれば True。
+
+        以前の回答は sample_answer_history に残す。スキップ・未回答は教師データに使わない。
+        """
+        new = set(genre_ids) if status == ANSWERED else set()
+        if status not in (UNANSWERED, ANSWERED, SKIPPED):
+            raise ValueError(status)
+        if status == ANSWERED and not new:
+            raise ValueError("回答済みにするにはジャンルを1つ以上選んでください")
+        cur = self.sample_answer(sample_id)
+        if cur is None and status == UNANSWERED:
+            return False
+        if (cur is not None and cur["status"] == status and cur["genres"] == new
+                and cur["content_hash"] == content_hash):
+            return False
+        now = time.time()
+        if status == UNANSWERED:
+            self.conn.execute("DELETE FROM sample_answers WHERE sample_id=?", (sample_id,))
+        else:
+            self.conn.execute(
+                "INSERT INTO sample_answers(sample_id,status,content_hash,updated_at,model_version) "
+                "VALUES (?,?,?,?,NULL) ON CONFLICT(sample_id) DO UPDATE SET status=excluded.status, "
+                "content_hash=excluded.content_hash, updated_at=excluded.updated_at, model_version=NULL",
+                (sample_id, status, content_hash, now))
+            self.conn.execute("DELETE FROM sample_answer_genres WHERE sample_id=?", (sample_id,))
+            self.conn.executemany("INSERT INTO sample_answer_genres VALUES (?,?)",
+                                  [(sample_id, g) for g in sorted(new)])
+        self.conn.execute(
+            "INSERT INTO sample_answer_history(sample_id,status,genre_ids,content_hash,created_at) "
+            "VALUES (?,?,?,?,?)", (sample_id, status, json.dumps(sorted(new)), content_hash, now))
+        self.conn.commit()
+        return True
+
+    def sample_answer_history(self, sample_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM sample_answer_history WHERE sample_id=? ORDER BY id",
+                                 (sample_id,)).fetchall()
+
+    def mark_sample_answers_applied(self, version: int, sample_ids) -> None:
+        self.conn.executemany("UPDATE sample_answers SET model_version=? WHERE sample_id=?",
+                              [(version, s) for s in sample_ids])
+        self.conn.commit()
+
+    def initial_state(self) -> str | None:
+        return self.get_setting("initial_state")
 
     # --- 集計 ---------------------------------------------------------------
     def stats(self) -> dict:

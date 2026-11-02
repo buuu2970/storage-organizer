@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread, Signal, Slot
+import os
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from . import pages
 from .db import Database
+from .profiles import ProfileManager
 from .file_table_model import COL_CATEGORY, COL_MTIME, COL_NAME, COL_SIZE, FileTableModel
 from .formatting import format_bytes_exact, format_duration, format_size
 from .scan_worker import ScanWorker
@@ -279,12 +283,26 @@ PAGE_TITLES = ["ダッシュボード", "ファイル調査", "動画一覧", "�
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, db: Database | None = None, profiles: ProfileManager | None = None,
+                 samples_root=None) -> None:
         super().__init__()
         self.setWindowTitle("RecSort AI（試作） - 録画整理支援")
         self.resize(1280, 800)
-        self.ask_initial_learning = True  # スキャン後に初期学習を案内するか（テストでは False）
-        self.ctx = pages.AppContext(db or Database())
+        self.ask_initial_learning = True  # 起動時・スキャン後に初期学習を案内するか（テストでは False）
+        # db だけを渡したとき（テスト・単体利用）はプロファイル切り替えを使わない
+        self.profiles = profiles if profiles is not None or db is not None else ProfileManager()
+        if db is None:
+            db = Database(self.profiles.data_dir())
+        if samples_root is None:
+            samples_root = self.profiles.samples_root if self.profiles else db.data_dir / "samples"
+        self._samples_root = samples_root
+        self._build(db)
+        QTimer.singleShot(0, self.prompt_initial_learning)
+
+    def _build(self, db: Database) -> None:
+        """現在のプロファイルの画面一式を作る（切り替え時は作り直す）。"""
+        name = self.profiles.current()["name"] if self.profiles else ""
+        self.ctx = pages.AppContext(db, self._samples_root, name)
         c = self.ctx
         self.scan_page = ScanPage()
         self.dashboard = pages.DashboardPage(c)
@@ -305,24 +323,44 @@ class MainWindow(QMainWindow):
         central = QWidget()
         outer = QVBoxLayout(central)
         body = QHBoxLayout()
+        left = QVBoxLayout()
+        self.profile_combo = QComboBox()
+        self.add_profile_button = QPushButton("プロファイルを追加")
+        if self.profiles:
+            for p in self.profiles.profiles():
+                self.profile_combo.addItem(p["name"], p["id"])
+            self.profile_combo.setCurrentIndex(self.profile_combo.findData(self.profiles.current()["id"]))
+            left.addWidget(QLabel("プロファイル"))
+            left.addWidget(self.profile_combo)
+            left.addWidget(self.add_profile_button)
+        else:
+            self.profile_combo.setVisible(False)
+            self.add_profile_button.setVisible(False)
         self.nav = QListWidget()
         self.nav.addItems(PAGE_TITLES)
         self.nav.setFixedWidth(150)
+        left.addWidget(self.nav, 1)
         self.stack = QStackedWidget()
         for w in self.page_widgets:
             self.stack.addWidget(w)
-        body.addWidget(self.nav)
+        body.addLayout(left)
         body.addWidget(self.stack, 1)
         outer.addLayout(body, 1)
         self.task_bar = pages.TaskBar(c)
         outer.addWidget(self.task_bar)
+        old = self.takeCentralWidget()
         self.setCentralWidget(central)
+        if old is not None:
+            old.deleteLater()
 
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.scan_page.scan_completed.connect(self._on_scan_completed)
         c.open_video_requested.connect(self.open_video)
         c.open_compress_requested.connect(self.open_compress)
         self.detail.back_requested.connect(lambda: self.show_page(self.video_list))
+        self.profile_combo.activated.connect(
+            lambda i: self.switch_profile(self.profile_combo.itemData(i)))
+        self.add_profile_button.clicked.connect(self.add_profile)
         self.nav.setCurrentRow(0)
 
     def show_page(self, widget) -> None:
@@ -336,35 +374,87 @@ class MainWindow(QMainWindow):
         self.compress.select_video(video_id)
         self.show_page(self.compress)
 
+    # --- プロファイル -----------------------------------------------------
+    def add_profile(self) -> None:
+        if self.profiles is None:
+            return
+        profile = self.profiles.add()
+        self.switch_profile(profile["id"])
+
+    def switch_profile(self, profile_id: str) -> bool:
+        """プロファイルを切り替える。実行中の処理は止めてから、画面を作り直す。"""
+        if self.profiles is None:
+            return False
+        current = self.profiles.current()["id"]
+        if profile_id == current and self.ctx.db.data_dir == self.profiles.data_dir(profile_id):
+            self._sync_combo()
+            return False
+        if self.ctx.is_busy() or self.scan_page.is_scanning():
+            if QMessageBox.question(self, "プロファイルの切り替え",
+                                    "実行中の処理を中止して切り替えますか？\n"
+                                    "（途中までの結果は元のプロファイルにだけ保存されます）") \
+                    != QMessageBox.StandardButton.Yes:
+                self._sync_combo()
+                return False
+        self._teardown()
+        self.profiles.set_current(profile_id)
+        self._build(Database(self.profiles.data_dir(profile_id)))
+        QTimer.singleShot(0, self.prompt_initial_learning)
+        return True
+
+    def _sync_combo(self) -> None:
+        if self.profiles:
+            self.profile_combo.setCurrentIndex(self.profile_combo.findData(self.profiles.current()["id"]))
+
+    def _teardown(self) -> None:
+        self.scan_page.shutdown()
+        for page in (self.detail, self.initial, self.compress):
+            page.player.stop()
+        self.ctx.detach()
+        self.ctx.db.close()
+
+    # --- 初期学習の案内 -----------------------------------------------------
+    def prompt_initial_learning(self) -> None:
+        """未実施・途中のときに初期学習を案内する。スキップしても通常機能は使える。"""
+        if not self.ask_initial_learning or self.ctx.db.initial_state() in ("done", "skipped"):
+            return
+        resume = self.ctx.db.initial_state() == "in_progress"
+        box = QMessageBox(self)
+        box.setWindowTitle("初期AI学習")
+        box.setText(f"最初に{pages.INITIAL_SAMPLE_COUNT}本の動画を分類して、あなた専用のジャンル分類AIを作成します。\n"
+                    "初期学習を行わない間は、分類の精度が十分ではありません。")
+        resume_button = box.addButton("前回の続きから再開", QMessageBox.ButtonRole.AcceptRole) if resume else None
+        start = box.addButton("初期学習を開始", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("あとで実行する", QMessageBox.ButtonRole.RejectRole)
+        skip = box.addButton("初期学習をスキップ", QMessageBox.ButtonRole.DestructiveRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is not None and clicked in (start, resume_button):
+            if clicked is start and not resume:
+                self.ctx.db.set_setting("initial_index", "0")
+            self.show_page(self.initial)
+            self.initial.start()
+        elif clicked is skip:
+            self.ctx.db.set_setting("initial_state", "skipped")
+            self.ctx.data_changed.emit()
+
     def _on_scan_completed(self, result, records) -> None:
         videos = [r for r in records if r.category == "動画"]
+        # 初期学習用サンプルは通常の動画一覧に登録しない
+        samples = [r for r in videos if self.ctx.samples.is_sample_path(os.path.join(r.folder, r.name))]
+        videos = [r for r in videos if r not in samples]
         added, invalidated = self.ctx.db.register_videos(
             videos, result.root, complete_scan=not result.cancelled and result.skipped == 0)
         self.ctx.data_changed.emit()
         note = f"動画 {len(videos)} 本を登録しました（新規 {added} 本"
         note += f"、内容が変わったため解析をやり直す動画 {invalidated} 本）" if invalidated else "）"
+        if samples:
+            note += f"。初期学習用サンプル {len(samples)} 本は登録しません"
         self.scan_page.current_dir_label.set_full_text(
             self.scan_page.current_dir_label.toolTip() + "  /  " + note)
-        if (videos and self.ask_initial_learning
-                and self.ctx.db.get_setting("initial_state") is None):
-            box = QMessageBox(self)
-            box.setWindowTitle("初期AI学習")
-            box.setText("あなたの動画の分類方法をAIに教えませんか？\n"
-                        "特徴の異なる動画を最大5本選ぶので、ジャンルを付けてください。")
-            start = box.addButton("初期学習を開始", QMessageBox.ButtonRole.AcceptRole)
-            box.addButton("今はスキップ", QMessageBox.ButtonRole.RejectRole)
-            box.exec()
-            if box.clickedButton() is start:
-                self.show_page(self.initial)
-                self.initial.start()
-            else:
-                self.ctx.db.set_setting("initial_state", "skipped")
-                self.ctx.data_changed.emit()
+        if videos and self.ctx.db.initial_state() is None:
+            self.prompt_initial_learning()
 
     def closeEvent(self, event) -> None:
-        self.scan_page.shutdown()
-        self.ctx.shutdown()
-        for page in (self.detail, self.initial, self.compress):
-            page.player.stop()
-        self.ctx.db.close()
+        self._teardown()
         super().closeEvent(event)

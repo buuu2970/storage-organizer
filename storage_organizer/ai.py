@@ -22,8 +22,9 @@ from pathlib import Path
 import numpy as np
 
 from . import media
-from .db import (CLASSIFY_SCOPE, CURATE_ALL_SCOPE, TRAINABLE_CHOICES, Database, curate_genre_scope,
-                 loads)
+from .db import (ANSWERED, CLASSIFY_SCOPE, CURATE_ALL_SCOPE, TRAINABLE_CHOICES, Database,
+                 curate_genre_scope, loads)
+from .samples import SAMPLE_PREFIX, SampleStore, display_name
 
 FEATURE_NAMES = [
     "長さ(log)", "縦横比", "解像度(log)", "ビットレート(log)", "音声あり",
@@ -159,16 +160,57 @@ def _load_vectors(db: Database) -> dict[int, np.ndarray]:
     return result
 
 
-def build_model(db: Database, version: int) -> tuple[Model | None, str, list[int]]:
-    """教師データからモデルを作る。(モデル, 説明, 使った動画ID)"""
+def _sample_training(db: Database, store) -> tuple[dict[str, np.ndarray], list[tuple], dict[str, int]]:
+    """初期12本のうち学習に使える回答。
+
+    戻り値: (解析済みサンプルの全特徴, [(サンプルID, 表示名, ジャンル)], 除外理由ごとの件数)
+    - 使うのはこのプロファイルの「回答済み」だけ（スキップ・未回答は使わない）
+    - 回答後に動画が入れ替わった回答は使わない（再確認が必要）
+    """
+    if store is None:
+        return {}, [], {}
+    rows = {r["sample_id"]: r for r in store.samples()}
+    usable = store.usable_features()
+    vectors = {}
+    for sid, r in usable.items():
+        v = feature_vector(loads(r["meta"]), loads(r["features"]))
+        if v is not None:
+            vectors[sid] = v
+    labeled, skipped = [], {"stale": 0, "no_features": 0}
+    for sid, ans in db.sample_answers().items():
+        if ans["status"] != ANSWERED or sid not in rows:
+            continue
+        if ans["content_hash"] != rows[sid]["content_hash"]:
+            skipped["stale"] += 1
+            continue
+        if sid not in vectors:
+            skipped["no_features"] += 1
+            continue
+        labeled.append((sid, display_name(rows[sid]), ans["genres"]))
+    return vectors, labeled, skipped
+
+
+def build_model(db: Database, version: int, store=None) -> tuple[Model | None, str, list]:
+    """教師データからモデルを作る。(モデル, 説明, 使った動画ID と "sample:サンプルID")
+
+    store（samples.SampleStore）を渡すと、初期12本への回答も教師データにする。
+    """
     vectors = _load_vectors(db)
-    if not vectors:
+    sample_vectors, sample_labeled, sample_skipped = _sample_training(db, store)
+    if not vectors and not sample_vectors:
         return None, "解析済みの動画がありません。先に動画を解析してください。", []
     trainable = {g["id"] for g in db.genres() if not g["exclude_from_training"]}
     user_genres = db.all_user_genres()
     names = {r["id"]: r["name"] for r in db.videos()}
     samples, used, no_features = [], [], 0
-    norm = Normalizer.fit(list(vectors.values()))
+    all_vectors = list(vectors.values()) + list(sample_vectors.values())
+    norm = Normalizer.fit(all_vectors)
+    for sid, name, genres in sample_labeled:
+        key = SAMPLE_PREFIX + sid
+        used.append(key)  # 「その他・不明」だけの回答も負例として使う
+        samples.append({"video_id": key, "name": name,
+                        "z": norm.transform(sample_vectors[sid]).round(5).tolist(),
+                        "genres": sorted(set(genres) & trainable)})
     for t in db.training_rows():
         vid = t["video_id"]
         genres = sorted(user_genres.get(vid, set()) & trainable)
@@ -181,11 +223,12 @@ def build_model(db: Database, version: int) -> tuple[Model | None, str, list[int
     genre_ids = sorted({g for s in samples for g in s["genres"]})
     if not genre_ids:
         msg = "学習できるジャンルが付いた教師データがありません（「その他・不明」は学習対象外です）。"
-        if no_features:
-            msg += f" 解析されていない教師データが {no_features} 件あります。"
+        if no_features or sample_skipped.get("no_features"):
+            msg += (f" 解析されていない教師データが "
+                    f"{no_features + sample_skipped.get('no_features', 0)} 件あります。")
         return None, msg, []
-    # 距離の目安: 全動画の標準化ベクトルどうしの距離の中央値
-    zs = [norm.transform(v) for v in vectors.values()]
+    # 距離の目安: 全動画（初期サンプルを含む）の標準化ベクトルどうしの距離の中央値
+    zs = [norm.transform(v) for v in all_vectors]
     if len(zs) >= 2:
         idx = np.random.default_rng(0).choice(len(zs), size=min(len(zs), 200), replace=False)
         pts = [zs[i] for i in idx]
@@ -193,9 +236,15 @@ def build_model(db: Database, version: int) -> tuple[Model | None, str, list[int
         tau = max(float(np.median(ds)), 0.3)
     else:
         tau = 1.0
-    note = f"教師データ {len(samples)} 件で作成しました。"
-    if no_features:
-        note += f"（解析されていない教師データ {no_features} 件は除外）"
+    n_initial = len(sample_labeled)
+    note = f"教師データ {len(samples)} 件" + (f"（うち初期12本の回答 {n_initial} 件）" if n_initial else "") \
+        + "で作成しました。"
+    if no_features or sample_skipped.get("no_features"):
+        note += f"（解析されていない教師データ {no_features + sample_skipped.get('no_features', 0)} 件は除外）"
+    if sample_skipped.get("stale"):
+        note += f"（動画が入れ替わった初期サンプルの回答 {sample_skipped['stale']} 件は再確認まで除外）"
+    if len(samples) < 20:
+        note += " 教師データが少ないため、分類の精度は保証できません。"
     return Model(version, norm, tau, samples, genre_ids), note, used
 
 
@@ -232,10 +281,10 @@ def load_active_model(db: Database) -> Model | None:
         return None
 
 
-def retrain(db: Database) -> dict:
+def retrain(db: Database, store=None) -> dict:
     """手動の「再学習」。新しいモデルを作り、条件を満たせば採用する。失敗時は以前のモデルを維持。"""
     version = db.next_model_version()
-    model, note, used = build_model(db, version)
+    model, note, used = build_model(db, version, store)
     if model is None:
         return {"adopted": False, "message": "再学習できませんでした: " + note}
     ev = evaluate(model)
@@ -255,7 +304,8 @@ def retrain(db: Database) -> dict:
     db.add_model(version, len(model.samples), str(path), ev, activate=adopt)
     if not adopt:
         return {"adopted": False, "message": why, "evaluation": ev}
-    db.mark_training_applied(version, used)
+    db.mark_training_applied(version, [u for u in used if isinstance(u, int)])
+    db.mark_sample_answers_applied(version, [u[len(SAMPLE_PREFIX):] for u in used if isinstance(u, str)])
     counts = classify_all(db, model)
     return {"adopted": True, "version": version, "evaluation": ev, "message": note,
             "classified": counts}
@@ -281,6 +331,11 @@ def classify_all(db: Database, model: Model | None = None) -> dict:
                 counts["未分類"] += 1
             continue
         r = model.classify(model.normalizer.transform(v), names=names)
+        rejected = set(loads(row["ai_rejected"], []))
+        if rejected and r["genres"]:  # ユーザーが却下したジャンルは再提案しない
+            r["genres"] = [e for e in r["genres"] if e["genre_id"] not in rejected]
+            if not r["genres"]:
+                r["state"], r["reason"] = "未分類", "提案できるジャンルは以前ユーザーが却下したものだけです"
         db.update_video(row["id"], ai_state=r["state"], ai_genres=r["genres"],
                         ai_candidates=r["candidates"][:3], ai_reason=r["reason"],
                         ai_model_version=model.version)
@@ -463,13 +518,18 @@ def task_find_duplicates(data_dir, cancel: threading.Event, report) -> dict:
         db.close()
 
 
-def task_retrain(data_dir, cancel, report) -> dict:
+def task_retrain(data_dir, cancel, report, samples_root=None) -> dict:
     db = Database(data_dir)
+    store = SampleStore(samples_root) if samples_root else None
     try:
         report({"text": "再学習中…"})
-        return retrain(db)
+        if store is not None:
+            store.refresh()  # 入れ替わったサンプルの回答を使わないよう、最新の状態で確認する
+        return retrain(db, store)
     finally:
         db.close()
+        if store is not None:
+            store.close()
 
 
 def task_compress(data_dir, tools, video_id: int, out_dir: str, preset: str,

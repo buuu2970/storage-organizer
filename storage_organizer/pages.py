@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import os
 from functools import partial
+from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import (QAbstractTableModel, QCoreApplication, QModelIndex, QObject, Qt, QThread, QUrl,
+                            Signal)
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGridLayout,
@@ -18,7 +20,9 @@ from PySide6.QtWidgets import (
 )
 
 from . import ai, media
-from .db import CURATION_CHOICES, Database, loads
+from . import samples as samples_mod
+from .db import ANSWERED, CURATION_CHOICES, INITIAL_STATES, SKIPPED, Database, loads
+from .samples import INITIAL_SAMPLE_COUNT, STATUS_TEXT, SampleStore
 from .formatting import format_bytes_exact, format_datetime, format_size
 from .scan_worker import TaskWorker
 
@@ -36,9 +40,13 @@ class AppContext(QObject):
     task_state_changed = Signal(bool)
     task_progress = Signal(object)
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, samples_root=None, profile_name: str = "") -> None:
         super().__init__()
         self.db = db
+        # 初期学習用サンプル（全プロファイル共通。回答はこのプロファイルの db に保存する）
+        self.samples_root = Path(samples_root) if samples_root else db.data_dir / "samples"
+        self.samples = SampleStore(self.samples_root)
+        self.profile_name = profile_name
         self._thread: QThread | None = None
         self._worker: TaskWorker | None = None
         self._on_done = None
@@ -108,6 +116,20 @@ class AppContext(QObject):
             self._thread.quit()
             self._thread.wait(10000)
 
+    def detach(self) -> None:
+        """プロファイル切り替え用: 実行中の処理を止め、完了時の処理を呼ばないようにして待つ。
+
+        処理は開始時のプロファイルのデータフォルダにしか書き込まないため、
+        次のプロファイルへ結果が混ざることはない。
+        """
+        self._on_done = self._on_error = None
+        thread = self._thread
+        self.shutdown()
+        if thread is not None:
+            thread.wait()
+        QCoreApplication.processEvents()
+        self.samples.close()
+
     # --- よく使う処理 ------------------------------------------------------
     def analyze(self, video_ids: list[int], on_done=None, parent=None) -> bool:
         tools = self.tools()
@@ -138,7 +160,35 @@ class AppContext(QObject):
                 parent, "再学習" + ("（採用）" if result.get("adopted") else "（以前のモデルを維持）"), text)
             if on_done:
                 on_done(result)
-        return self.run_task("再学習", lambda c, r: ai.task_retrain(data_dir, c, r), done, parent=parent)
+        samples_root = self.samples_root
+        return self.run_task("再学習", lambda c, r: ai.task_retrain(data_dir, c, r, samples_root),
+                             done, parent=parent)
+
+    def analyze_samples(self, on_done=None, parent=None, quiet: bool = False) -> bool:
+        """共通サンプルの解析（特徴量キャッシュ）。回答はしなくても再生・分類はできる。"""
+        tools = self.tools()
+        if not tools.available:
+            if not quiet:
+                QMessageBox.warning(parent, "FFmpeg が必要です",
+                                    "初期サンプルの解析（学習に使う特徴量の計算）には FFmpeg が必要です。"
+                                    "回答の入力と保存はそのままできます。")
+            return False
+        root, frames = self.samples_root, self.max_frames()
+        return self.run_task("初期サンプルの解析",
+                             lambda c, r: samples_mod.task_analyze_samples(root, tools, frames, c, r),
+                             on_done, parent=parent)
+
+
+def initial_state_text(ctx: AppContext) -> str:
+    """初期学習の進捗（未実施・途中・完了・スキップ）と回答数。"""
+    state = INITIAL_STATES.get(ctx.db.initial_state(), "未実施")
+    ids = {r["sample_id"] for r in ctx.samples.samples()}
+    answers = ctx.db.sample_answers()
+    answered = sum(1 for s, a in answers.items() if s in ids and a["status"] == ANSWERED)
+    skipped = sum(1 for s, a in answers.items() if s in ids and a["status"] == SKIPPED)
+    if not ids:
+        return state
+    return f"{state}（回答済み {answered} / {len(ids)} 本・スキップ {skipped} 本）"
 
 
 def describe_evaluation(ev: dict) -> str:
@@ -492,7 +542,9 @@ class DashboardPage(BasePage):
             f"お気に入り {s['favorite']:,} 本 / 保護 {s['protected']:,} 本"
             + (f"\n見つからなくなった動画 {s['missing']:,} 本（一覧には表示しません）" if s["missing"] else ""))
         model = self.ctx.db.active_model()
-        state = {"done": "完了", "skipped": "スキップ"}.get(self.ctx.db.get_setting("initial_state"), "未実施")
+        state = initial_state_text(self.ctx)
+        if self.ctx.db.initial_state() != "done":
+            state += "（初期学習を終えるまで、ジャンル分類の精度は十分ではありません）"
         if model:
             ev = loads(model["evaluation"], {})
             text = (f"採用中のモデル: v{model['version']}（教師データ {model['n_samples']} 件）\n"
@@ -508,7 +560,9 @@ class DashboardPage(BasePage):
         self.tool_label.setText(
             f"FFmpeg: {tools.ffmpeg or '見つかりません'}\nFFprobe: {tools.ffprobe or '見つかりません'}\n"
             + ("" if tools.available else "→ 解析・サムネイル・重複以外の圧縮には FFmpeg が必要です。")
-            + f"\nデータ保存先: {self.ctx.data_dir}")
+            + (f"\nプロファイル: {self.ctx.profile_name}" if self.ctx.profile_name else "")
+            + f"\nデータ保存先: {self.ctx.data_dir}"
+            + f"\n初期学習用サンプル: {self.ctx.samples.sample_dir() or '未指定（初期AI学習の画面で指定）'}")
 
     def _analyze(self):
         ids = [r["id"] for r in self.ctx.db.videos()
@@ -658,6 +712,17 @@ class VideoDetailPage(BasePage):
         self.save_genres_button = QPushButton("ジャンルを保存（教師データに登録）")
         gv.addWidget(self.genres)
         gv.addWidget(self.save_genres_button)
+        suggest = QHBoxLayout()
+        self.ai_suggest_label = QLabel()
+        self.ai_suggest_label.setWordWrap(True)
+        self.approve_ai_button = QPushButton("AIの提案を承認")
+        self.reject_ai_button = QPushButton("AIの提案を却下")
+        suggest.addWidget(self.ai_suggest_label, 1)
+        suggest.addWidget(self.approve_ai_button)
+        suggest.addWidget(self.reject_ai_button)
+        gv.addLayout(suggest)
+        gv.addWidget(note_label("AIのジャンルは確定前の提案です。承認すると確定ジャンル（教師データ）になります。"
+                                "修正する場合は上で選び直して保存してください。"))
         rv.addWidget(genre_box)
         tag_box = QGroupBox("タグ")
         tv = QVBoxLayout(tag_box)
@@ -706,6 +771,8 @@ class VideoDetailPage(BasePage):
         self.favorite_box.toggled.connect(partial(self._set_flag, "favorite"))
         self.protect_box.toggled.connect(partial(self._set_flag, "protected"))
         self.save_genres_button.clicked.connect(self._save_genres)
+        self.approve_ai_button.clicked.connect(self._approve_ai)
+        self.reject_ai_button.clicked.connect(self._reject_ai)
         self.tag_list.itemChanged.connect(self._tag_toggled)
         self.add_tag_button.clicked.connect(self._add_tag)
         for status, b in self.ai_tag_buttons.items():
@@ -768,6 +835,13 @@ class VideoDetailPage(BasePage):
         # AI・推薦・重複・解析
         names = db.genre_names()
         user = db.user_genres(row["id"])
+        proposal = [e["genre_id"] for e in loads(row["ai_genres"], []) if e["genre_id"] in names]
+        has_proposal = bool(proposal) and not user
+        self.ai_suggest_label.setText(
+            "AIの提案: " + "、".join(names[g] for g in proposal) if has_proposal
+            else ("AIの提案: なし（確定済み）" if user else "AIの提案: なし"))
+        self.approve_ai_button.setEnabled(has_proposal)
+        self.reject_ai_button.setEnabled(has_proposal)
         lines = []
         if user:
             lines.append("<b>AI判定:</b> 手動分類済みのため、AIは結果を上書きしません")
@@ -822,6 +896,21 @@ class VideoDetailPage(BasePage):
                                     "ジャンルを保存しました。教師データとして登録し、次回の「再学習」で反映します。"
                                     if self.genres.checked_ids() else "ジャンルの設定を外しました。")
             self.ctx.data_changed.emit()
+
+    def _approve_ai(self) -> None:
+        if self.video_id is None:
+            return
+        names = self.ctx.db.genre_names()
+        ids = {e["genre_id"] for e in loads(self.ctx.db.video(self.video_id)["ai_genres"], [])} & set(names)
+        if ids and self.ctx.db.set_user_genres(self.video_id, ids, source="AI提案の承認"):
+            self.genres.set_checked(ids)
+            self.ctx.data_changed.emit()
+
+    def _reject_ai(self) -> None:
+        if self.video_id is None:
+            return
+        self.ctx.db.reject_ai_genres(self.video_id)
+        self.ctx.data_changed.emit()
 
     def _tag_toggled(self, item: QListWidgetItem) -> None:
         name = item.data(Qt.ItemDataRole.UserRole)
@@ -928,141 +1017,363 @@ class GenrePage(BasePage):
 # 初期AI学習
 # =============================================================================
 class InitialLearningPage(BasePage):
+    """初期12本によるジャンル分類AIの初期学習。
+
+    - 開発者が用意した12本（全プロファイル共通）を固定の順番で全部見せる
+    - 回答（ジャンル・スキップ）は「回答を保存して次へ」などで確定したときにプロファイルの DB に保存する
+    - 途中で終了しても、次回は続きから再開できる。回答済みの動画も後から修正できる
+    - 厳選（残す／整理候補）はここでは聞かない
+    """
+
     def __init__(self, ctx, parent=None):
         super().__init__(ctx, parent)
-        self.candidates: list[int] = []
-        self.answers: dict[int, set[int] | None] = {}
+        self.sample_ids: list[str] = []
         self.index = 0
+        self._retrain_after_analysis = False
         layout = QVBoxLayout(self)
-        layout.addWidget(note_label("あなたの動画の分類方法をAIに教えます。特徴の異なる動画を最大5本選ぶので、"
-                                    "ジャンルを付けてください（複数選択可）。確定した回答だけを教師データにします。"
-                                    "5本で全ジャンルが網羅されるとは限りません。" + AI_NOTE))
+        layout.addWidget(note_label(
+            f"最初に{INITIAL_SAMPLE_COUNT}本の動画を分類して、あなた専用のジャンル分類AIを作成します。"
+            "各動画にあなたが考えるジャンルを付けてください（複数選択可・新しいジャンルも追加できます）。"
+            "最後まで再生しなくても回答できます。回答はジャンル分類AIの学習だけに使い、"
+            "厳選（残す／整理候補）の学習には使いません。少量のデータなので分類精度は保証できません。"))
         top = QHBoxLayout()
         self.status_label = QLabel()
-        self.start_button = QPushButton("動画を解析して5本を選ぶ")
+        self.status_label.setWordWrap(True)
+        self.folder_button = QPushButton("サンプルフォルダを指定…")
+        self.start_button = QPushButton("初期学習を開始")
         self.skip_all_button = QPushButton("初期学習をスキップ")
         top.addWidget(self.status_label, 1)
-        top.addWidget(self.start_button)
-        top.addWidget(self.skip_all_button)
+        for b in (self.folder_button, self.start_button, self.skip_all_button):
+            top.addWidget(b)
         layout.addLayout(top)
+        self.error_label = QLabel()
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet("color: #b00020;")
+        layout.addWidget(self.error_label)
+
         self.step = QWidget()
         sv = QVBoxLayout(self.step)
+        sv.setContentsMargins(0, 0, 0, 0)
         self.step_label = QLabel()
         self.step_label.setStyleSheet("font-weight: bold;")
         sv.addWidget(self.step_label)
-        body = QHBoxLayout()
+        body = QSplitter()
+        self.sample_list = QListWidget()  # 12本の一覧（クリックで移動・回答済みの修正）
+        self.sample_list.setMaximumWidth(260)
+        body.addWidget(self.sample_list)
         self.player = VideoPlayer()
-        body.addWidget(self.player, 3)
-        side = QVBoxLayout()
+        body.addWidget(self.player)
+        side = QWidget()
+        side_layout = QVBoxLayout(side)
         self.thumb = QLabel()
         self.thumb.setFixedSize(240, 135)
-        self.thumb.setStyleSheet("background: #222;")
+        self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumb.setStyleSheet("background: #222; color: #aaa;")
         self.info = QLabel()
         self.info.setWordWrap(True)
+        self.sample_error = QLabel()
+        self.sample_error.setWordWrap(True)
+        self.sample_error.setStyleSheet("color: #b00020;")
         self.genres = GenreChecklist(ctx.db)
-        side.addWidget(self.thumb)
-        side.addWidget(self.info)
-        side.addWidget(self.genres)
-        side.addStretch()
-        body.addLayout(side, 2)
-        sv.addLayout(body, 1)
+        add_row = QHBoxLayout()
+        self.new_genre = QLineEdit()
+        self.new_genre.setPlaceholderText("新しいジャンル名")
+        self.add_genre_button = QPushButton("ジャンルを追加")
+        add_row.addWidget(self.new_genre, 1)
+        add_row.addWidget(self.add_genre_button)
+        side_layout.addWidget(self.thumb)
+        side_layout.addWidget(self.info)
+        side_layout.addWidget(self.sample_error)
+        side_layout.addWidget(QLabel("ジャンル（複数選択可）"))
+        side_layout.addWidget(self.genres)
+        side_layout.addLayout(add_row)
+        side_layout.addStretch()
+        body.addWidget(side)
+        body.setSizes([220, 520, 380])
+        sv.addWidget(body, 1)
         nav = QHBoxLayout()
         self.prev_button = QPushButton("前へ")
         self.skip_button = QPushButton("この動画をスキップ")
-        self.next_button = QPushButton("次へ")
+        self.next_button = QPushButton("回答を保存して次へ")
+        self.suspend_button = QPushButton("途中保存して終了")
+        self.interim_button = QPushButton("回答済みの分で暫定学習")
         self.finish_button = QPushButton("完了して学習する")
-        for b in (self.prev_button, self.skip_button, self.next_button, self.finish_button):
+        for b in (self.prev_button, self.skip_button, self.next_button, self.suspend_button,
+                  self.interim_button, self.finish_button):
             nav.addWidget(b)
         sv.addLayout(nav)
         layout.addWidget(self.step, 1)
         self.step.setVisible(False)
+
+        self.folder_button.clicked.connect(self.choose_folder)
         self.start_button.clicked.connect(self.start)
         self.skip_all_button.clicked.connect(self.skip_all)
-        self.prev_button.clicked.connect(lambda: self._move(-1))
-        self.next_button.clicked.connect(lambda: self._move(1))
-        self.skip_button.clicked.connect(self._skip_current)
+        self.prev_button.clicked.connect(lambda: self.go_to(self.index - 1))
+        self.next_button.clicked.connect(self.save_and_next)
+        self.skip_button.clicked.connect(self.skip_current)
+        self.suspend_button.clicked.connect(self.suspend)
+        self.interim_button.clicked.connect(self.interim_train)
         self.finish_button.clicked.connect(self.finish)
+        self.add_genre_button.clicked.connect(self.add_genre)
+        self.new_genre.returnPressed.connect(self.add_genre)
+        self.sample_list.currentRowChanged.connect(self._on_list_row)
 
+    # --- 状態表示 ---------------------------------------------------------
     def refresh(self):
-        state = {"done": "完了", "skipped": "スキップ（いつでも開始できます）"}.get(
-            self.ctx.db.get_setting("initial_state"), "未実施")
-        self.status_label.setText(f"初期学習: {state} / 登録済みの動画 {self.ctx.db.stats()['videos']} 本")
+        db = self.ctx.db
+        state = db.initial_state()
+        self.status_label.setText("初期学習: " + initial_state_text(self.ctx))
+        self.start_button.setText("前回の続きから再開" if state == "in_progress" and not self.step.isVisible()
+                                  else "初期学習を開始")
+        self.start_button.setEnabled(not self.step.isVisible())
+        if not self.ctx.samples.samples():
+            self.error_label.setText(
+                "初期学習用のサンプル動画が見つかりません。「サンプルフォルダを指定…」で、"
+                f"{INITIAL_SAMPLE_COUNT}本の動画が入ったフォルダを選んでください"
+                f"（既定の場所: {samples_mod.project_sample_dir()}）。")
+        else:
+            problems = [f"{r['name']}: {STATUS_TEXT.get(r['status'], r['status'])}"
+                        for r in self.ctx.samples.samples() if r["status"] != "ok"]
+            self.error_label.setText(("読み込めないサンプルがあります（スキップできます）: " + " ／ ".join(problems))
+                                     if problems else "")
+        if self.step.isVisible():
+            self.genres.reload()
+            self._fill_list()
+            self._show()
 
     def hideEvent(self, event):
         self.player.stop()
         super().hideEvent(event)
 
-    def start(self):
-        db = self.ctx.db
-        if not db.video_ids():
-            QMessageBox.information(self, "初期学習", "動画がありません。先に「ファイル調査」でフォルダをスキャンしてください。")
-            return
-        todo = [r["id"] for r in db.videos() if r["analysis_state"] == "未解析" and not r["cloud_only"]]
-        if todo:
-            self.ctx.analyze(todo, on_done=lambda _: self._choose(), parent=self)
-        else:
-            self._choose()
+    def _rows(self) -> dict:
+        return {r["sample_id"]: r for r in self.ctx.samples.samples()}
 
-    def _choose(self):
-        self.candidates = ai.select_diverse(self.ctx.db, 5)
-        if not self.candidates:
-            QMessageBox.warning(self, "初期学習", "解析できた動画がないため、候補を選べませんでした。")
+    def _answer_state(self, row, answer) -> str:
+        if answer is None:
+            return "未回答"
+        if answer["status"] == ANSWERED and answer["content_hash"] != row["content_hash"]:
+            return "要再確認（動画が入れ替わりました）"
+        return answer["status"]
+
+    def _fill_list(self):
+        rows, answers = self._rows(), self.ctx.db.sample_answers()
+        names = self.ctx.db.genre_names()
+        self.sample_list.blockSignals(True)
+        self.sample_list.clear()
+        for i, sid in enumerate(self.sample_ids):
+            row = rows.get(sid)
+            if row is None:
+                continue
+            ans = answers.get(sid)
+            state = self._answer_state(row, ans)
+            detail = "、".join(names[g] for g in sorted(ans["genres"]) if g in names) \
+                if ans and state == ANSWERED else ""
+            item = QListWidgetItem(f"{i + 1}. {row['name']}\n　{state}" + (f"：{detail}" if detail else ""))
+            item.setToolTip(row["path"])
+            self.sample_list.addItem(item)
+        self.sample_list.setCurrentRow(self.index)
+        self.sample_list.blockSignals(False)
+
+    # --- 開始・サンプル指定 ---------------------------------------------------
+    def choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, f"初期学習用の動画（{INITIAL_SAMPLE_COUNT}本）があるフォルダ")
+        if folder:
+            self.register_folder(folder)
+
+    def register_folder(self, folder: str) -> bool:
+        try:
+            result = self.ctx.samples.register_folder(folder)
+        except OSError as e:
+            QMessageBox.warning(self, "サンプル動画", f"{e}\n\n動画が入ったフォルダを指定し直してください。")
+            return False
+        text = f"{result.count} 本を初期学習用サンプルとして登録しました。"
+        if result.changed:
+            text += f"\n内容が入れ替わった動画 {len(result.changed)} 本は、以前の回答を使わず再確認にします。"
+        if result.warnings:
+            text += "\n\n" + "\n".join(result.warnings)
+        QMessageBox.information(self, "サンプル動画", text)
+        self.ctx.data_changed.emit()
+        return True
+
+    def start(self):
+        store = self.ctx.samples
+        try:
+            store.ensure_registered()
+        except OSError:
+            pass
+        rows = store.samples()
+        if not rows:
+            QMessageBox.warning(self, "初期学習",
+                                "初期学習用のサンプル動画が見つかりません。\n"
+                                "「サンプルフォルダを指定…」で動画が入ったフォルダを選んでください。")
+            self.refresh()
             return
-        self.answers = {}
-        self.index = 0
+        self.sample_ids = [r["sample_id"] for r in rows]
+        if self.ctx.db.initial_state() != "done":
+            self.ctx.db.set_setting("initial_state", "in_progress")
+        saved = int(self.ctx.db.get_setting("initial_index", "0") or 0)
+        self.index = min(max(saved, 0), len(self.sample_ids) - 1)
         self.genres.reload()
         self.step.setVisible(True)
-        self._show()
+        if store.needs_analysis() and not self.ctx.is_busy():
+            # 学習用の特徴量を裏で計算する（回答の入力はそのまま続けられる）
+            self.ctx.analyze_samples(on_done=self._after_analysis, parent=self, quiet=True)
+        self.ctx.data_changed.emit()
+
+    def _after_analysis(self, _result):
+        if self._retrain_after_analysis:
+            self._retrain_after_analysis = False
+            self.ctx.retrain(self)
+
+    # --- 表示 -------------------------------------------------------------
+    def current_id(self) -> str | None:
+        return self.sample_ids[self.index] if self.sample_ids else None
 
     def _show(self):
-        vid = self.candidates[self.index]
-        row = self.ctx.db.video(vid)
+        sid = self.current_id()
+        row = self.ctx.samples.sample(sid) if sid else None
+        if row is None:
+            return
+        ans = self.ctx.db.sample_answer(sid)
+        state = self._answer_state(row, ans)
+        self.step_label.setText(f"{self.index + 1} / {len(self.sample_ids)}　{row['name']}　［{state}］")
         meta = loads(row["meta"], {})
-        self.step_label.setText(f"{self.index + 1} / {len(self.candidates)} 本目: {row['name']}")
-        self.info.setText(f"{row['name']}\n再生時間 {meta.get('duration', 0):.0f} 秒 / {format_size(row['size'])}")
+        duration = f"{meta['duration']:.0f} 秒" if meta.get("duration") else "未解析（再生すると表示されます）"
+        self.info.setText(f"ファイル名: {row['name']}\n再生時間: {duration}\n回答: {state}")
         thumbs = loads(row["thumbs"], [])
         pm = thumb_pixmap(thumbs[len(thumbs) // 2], 240, 135) if thumbs else None
-        self.thumb.setPixmap(pm) if pm else self.thumb.setText("サムネイルなし")
-        self.player.set_source(row["path"])
-        answer = self.answers.get(vid)
-        self.genres.set_checked(answer if answer else self.ctx.db.user_genres(vid))
+        if pm:
+            self.thumb.setPixmap(pm)
+        else:
+            self.thumb.clear()
+            self.thumb.setText("サムネイルなし\n（解析後に表示）")
+        if row["status"] != "ok":
+            self.sample_error.setText(f"この動画は使えません: {STATUS_TEXT.get(row['status'], row['status'])}"
+                                      f"{'（' + row['status_detail'] + '）' if row['status_detail'] else ''}。"
+                                      "スキップしてください。")
+            self.player.set_source(None)
+        else:
+            self.sample_error.setText(f"解析できませんでした（学習には使えません）: {row['analysis_error']}"
+                                      if row["analysis_state"] == "失敗" else "")
+            self.player.set_source(row["path"])
+        # 入れ替わった動画には古い回答を流用しない
+        self.genres.set_checked(ans["genres"] if ans and state == ANSWERED else set())
         self.prev_button.setEnabled(self.index > 0)
-        self.next_button.setEnabled(self.index < len(self.candidates) - 1)
+        self.next_button.setEnabled(row["status"] == "ok")
+        self.sample_list.blockSignals(True)
+        self.sample_list.setCurrentRow(self.index)
+        self.sample_list.blockSignals(False)
 
-    def _store(self):
-        if self.candidates:
-            self.answers[self.candidates[self.index]] = self.genres.checked_ids() or None
-
-    def _move(self, delta):
-        self._store()
-        self.index = max(0, min(len(self.candidates) - 1, self.index + delta))
+    def go_to(self, index: int):
+        if not self.sample_ids:
+            return
+        self.index = max(0, min(len(self.sample_ids) - 1, index))
+        self.ctx.db.set_setting("initial_index", str(self.index))
         self._show()
 
-    def _skip_current(self):
-        self.answers[self.candidates[self.index]] = None
-        if self.index < len(self.candidates) - 1:
-            self.index += 1
+    def _on_list_row(self, row: int):
+        if row >= 0 and row != self.index:
+            self.go_to(row)
+
+    # --- 回答 -------------------------------------------------------------
+    def _save(self, status: str, genres=()) -> None:
+        sid = self.current_id()
+        row = self.ctx.samples.sample(sid)
+        self.ctx.db.save_sample_answer(sid, status, genres, row["content_hash"])
+
+    def _advance(self):
+        self._fill_list()
+        if self.index < len(self.sample_ids) - 1:
+            self.go_to(self.index + 1)
+        else:
             self._show()
+            self.ctx.data_changed.emit()
+            QMessageBox.information(self, "初期学習", "最後の動画です。「完了して学習する」で学習します。"
+                                    "回答済みの動画は左の一覧から選んで修正できます。")
+            return
+        self.ctx.data_changed.emit()
+
+    def save_and_next(self):
+        ids = self.genres.checked_ids()
+        if not ids:
+            QMessageBox.information(self, "初期学習", "ジャンルを1つ以上選ぶか、「この動画をスキップ」を押してください。")
+            return
+        self._save(ANSWERED, ids)
+        self._advance()
+
+    def skip_current(self):
+        self._save(SKIPPED)
+        self._advance()
+
+    def add_genre(self):
+        name = self.new_genre.text().strip()
+        if not name:
+            return
+        try:
+            gid = self.ctx.db.add_genre(name)
+        except ValueError as e:
+            QMessageBox.warning(self, "ジャンルを追加できません", str(e))
+            return
+        checked = self.genres.checked_ids() | {gid}
+        self.genres.reload()
+        self.genres.set_checked(checked)
+        self.new_genre.clear()
+
+    def suspend(self):
+        """途中保存して終了。選びかけのジャンルがあれば回答として保存する。"""
+        if self.sample_ids:
+            ids = self.genres.checked_ids()
+            row = self.ctx.samples.sample(self.current_id())
+            if ids and row["status"] == "ok":
+                self._save(ANSWERED, ids)
+            self.ctx.db.set_setting("initial_index", str(self.index))
+        if self.ctx.db.initial_state() != "done":
+            self.ctx.db.set_setting("initial_state", "in_progress")
+        self._close_step()
+
+    def _close_step(self):
+        self.step.setVisible(False)
+        self.player.stop()
+        self.ctx.data_changed.emit()
 
     def skip_all(self):
         self.ctx.db.set_setting("initial_state", "skipped")
-        self.step.setVisible(False)
-        self.player.stop()
-        self.ctx.data_changed.emit()
+        self._close_step()
+
+    def _answered_count(self) -> int:
+        rows = self._rows()
+        return sum(1 for sid, a in self.ctx.db.sample_answers().items()
+                   if sid in rows and self._answer_state(rows[sid], a) == ANSWERED)
+
+    def _train(self) -> None:
+        if self.ctx.samples.needs_analysis():
+            self._retrain_after_analysis = True
+            if not self.ctx.is_busy():
+                if not self.ctx.analyze_samples(on_done=self._after_analysis, parent=self):
+                    self._retrain_after_analysis = False
+                    self.ctx.retrain(self)
+            return
+        if self.ctx.is_busy() and self.ctx.task_label == "初期サンプルの解析":
+            self._retrain_after_analysis = True  # 解析が終わってから学習する
+            return
+        self.ctx.retrain(self)
+
+    def interim_train(self):
+        """回答済みの分だけで暫定の分類基準を作る（足りなければ作らない）。"""
+        if not self._answered_count():
+            QMessageBox.information(self, "初期学習", "回答済みの動画がまだありません。")
+            return
+        self._train()
 
     def finish(self):
-        self._store()
-        labeled = {v: g for v, g in self.answers.items() if g}
-        if not labeled:
-            QMessageBox.information(self, "初期学習", "ジャンルが付いた動画がありません。少なくとも1本に付けてください。")
+        if not self._answered_count():
+            QMessageBox.information(self, "初期学習",
+                                    "回答済みの動画がありません。少なくとも1本にジャンルを付けてください"
+                                    "（回答しない場合は「初期学習をスキップ」）。")
             return
-        for vid, genres in labeled.items():
-            self.ctx.db.set_user_genres(vid, genres, source="初期学習")
         self.ctx.db.set_setting("initial_state", "done")
-        self.step.setVisible(False)
-        self.player.stop()
-        self.ctx.data_changed.emit()
-        self.ctx.retrain(self)
+        self._close_step()
+        self._train()
 
 
 # =============================================================================
@@ -1746,7 +2057,7 @@ class SettingsPage(BasePage):
         form.addRow("データ保存先", self.data_label)
         layout.addLayout(form)
         save = QPushButton("設定を保存")
-        reset = QPushButton("初期学習の状態をリセット（教師データは残します）")
+        reset = QPushButton("初期学習の状態をリセット（回答・教師データは残します）")
         model_reset = QPushButton("学習リセット（AIを選んで初期化）…")
         layout.addWidget(save)
         layout.addWidget(reset)
@@ -1787,6 +2098,7 @@ class SettingsPage(BasePage):
 
     def _reset(self):
         self.ctx.db.set_setting("initial_state", None)
+        self.ctx.db.set_setting("initial_index", None)
         self.ctx.data_changed.emit()
 
 

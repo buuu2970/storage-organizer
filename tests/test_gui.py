@@ -152,6 +152,10 @@ if QApplication is not None:
     from storage_organizer import media
     from storage_organizer.db import CURATE_ALL_SCOPE as CURATE_ALL
 
+# make_sample_videos.INITIAL_SAMPLES の順に付けるジャンル
+INITIAL_RULE = ["ゲーム", "ゲーム", "授業・学習", "授業・学習", "音楽・歌唱", "音楽・歌唱", "個人撮影",
+                "会議・仕事", "アニメ・テレビ", "その他・不明", "配信・実況", "音声・ラジオ"]
+
 
 def _snapshot(root: Path) -> dict:
     return {str(p): (p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
@@ -168,7 +172,10 @@ class RecSortGuiTest(unittest.TestCase):
         cls._videos = tempfile.TemporaryDirectory()
         cls.video_root = Path(cls._videos.name) / "videos"
         make_sample_videos.create(cls.video_root, media.find_ffmpeg().ffmpeg)
+        cls.initial_root = Path(cls._videos.name) / "initial"
+        make_sample_videos.create_initial(cls.initial_root, media.find_ffmpeg().ffmpeg)
         cls.before = _snapshot(cls.video_root)
+        cls.initial_before = _snapshot(cls.initial_root)
 
     @classmethod
     def tearDownClass(cls):
@@ -190,6 +197,7 @@ class RecSortGuiTest(unittest.TestCase):
             p.stop()
         self._data.cleanup()
         self.assertEqual(_snapshot(self.video_root), self.before, "元の動画が変更されました")
+        self.assertEqual(_snapshot(self.initial_root), self.initial_before, "初期サンプルが変更されました")
 
     def _new_window(self):
         w = MainWindow(Database(self._data.name))
@@ -234,25 +242,27 @@ class RecSortGuiTest(unittest.TestCase):
         sizes = [r["size"] for r in vl.model.rows]
         self.assertEqual(sizes, sorted(sizes, reverse=True))
 
-        # 初期学習: 解析 → 5本選択 → ジャンル付け → 学習
-        w.show_page(w.initial)
-        w.initial.start()
+        # 自分の動画を解析
+        w.show_page(w.dashboard)
+        w.dashboard.analyze_button.click()
         self._wait_task()
-        self.assertEqual(len(w.initial.candidates), 5)
+
+        # 初期学習（初期12本）: サンプル登録 → 12本に回答 → 学習
+        w.show_page(w.initial)
+        self.assertTrue(w.initial.register_folder(str(self.initial_root)))
+        w.initial.start()
+        self.assertEqual(len(w.initial.sample_ids), 12)
         self.assertTrue(w.initial.step.isVisible())
+        self._wait_task()  # 初期サンプルの解析
         g = {x["name"]: x["id"] for x in db.genres()}
-        rule = {"game": "ゲーム", "song": "音楽・歌唱", "lecture": "授業・学習", "camera": "個人撮影"}
-        for i, vid in enumerate(w.initial.candidates):
-            name = db.video(vid)["name"]
-            genre = next((v for k, v in rule.items() if name.startswith(k)), "その他・不明")
+        for genre in INITIAL_RULE:
             w.initial.genres.set_checked({g[genre]})
-            if i < len(w.initial.candidates) - 1:
-                w.initial.next_button.click()
+            w.initial.next_button.click()
         w.initial.finish_button.click()
         self._wait_task()
         self.assertEqual(db.get_setting("initial_state"), "done")
         self.assertIsNotNone(db.active_model())
-        self.assertEqual(db.stats()["manual"], 5)
+        self.assertEqual(db.stats()["manual"], 0)  # 初期サンプルは自分の動画としては登録しない
         self.assertTrue(any(r["ai_state"] in ("分類済み", "未分類") for r in db.videos()
                             if r["id"] not in db.all_user_genres()))
 
@@ -333,16 +343,20 @@ class RecSortGuiTest(unittest.TestCase):
         w.show_page(w.dashboard)
         self.assertIn("採用中のモデル: v", w.dashboard.ai_label.text())
 
-    def test_initial_learning_prompt_skip(self):
+    def test_initial_learning_prompt_later(self):
         w = self.window
         w.ask_initial_learning = True
-        with mock.patch.object(QMessageBox, "exec", lambda self: 0):  # 「今はスキップ」相当
+        with mock.patch.object(QMessageBox, "exec", lambda self: 0):  # 案内を閉じる＝「あとで実行する」
             self._scan()
-        self.assertEqual(w.ctx.db.get_setting("initial_state"), "skipped")
+        self.assertIsNone(w.ctx.db.get_setting("initial_state"))
         w.show_page(w.video_list)
         self.assertEqual(w.video_list.model.rowCount(), 11)  # 通常の動画管理は使える
         w.show_page(w.initial)
-        self.assertIn("スキップ", w.initial.status_label.text())
+        self.assertIn("未実施", w.initial.status_label.text())
+        w.initial.skip_all_button.click()
+        self.assertEqual(w.ctx.db.get_setting("initial_state"), "skipped")
+        w.show_page(w.video_list)
+        self.assertEqual(w.video_list.model.rowCount(), 11)
 
     def test_curation_flow(self):
         from storage_organizer import pages as pg
