@@ -1855,6 +1855,7 @@ class TaskBar(QWidget):
         self._on_state(False)
 
     def _on_state(self, busy: bool):
+        self.setVisible(busy)  # 動画AIの処理中だけステータス欄に表示する
         self.bar.setVisible(busy)
         self.cancel_button.setVisible(busy)
         self.cancel_button.setEnabled(True)

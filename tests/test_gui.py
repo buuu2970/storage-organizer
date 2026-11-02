@@ -260,7 +260,7 @@ class RecSortGuiTest(unittest.TestCase):
         ids = self._ids()
         w.open_video(ids["lecture_02.mp4"])
         d = w.detail
-        self.assertIs(w.stack.currentWidget(), d)
+        self.assertIs(w.video_ai.current_page(), d)
         self.assertIsNotNone(d.thumb_labels[0].pixmap())
         self.assertFalse(d.thumb_labels[0].pixmap().isNull())
         d.genres.set_checked({g["授業・学習"], g["会議・仕事"]})

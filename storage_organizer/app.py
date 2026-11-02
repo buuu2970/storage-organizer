@@ -7,6 +7,7 @@ import sys
 from PySide6.QtCore import QLibraryInfo, QLocale, QTranslator
 from PySide6.QtWidgets import QApplication
 
+from . import theme
 from .main_window import MainWindow
 
 
@@ -22,6 +23,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("録画・画像の整理支援")
     install_japanese(app)
+    theme.apply(app)
     window = MainWindow()
     window.show()
     return app.exec()

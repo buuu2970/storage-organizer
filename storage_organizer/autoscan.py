@@ -200,13 +200,17 @@ DRIVE_KIND_LABEL = {"internal": "内蔵ドライブ", "external": "外付けド�
                     "removable": "リムーバブルドライブ", "unknown": "種類を判別できないドライブ"}
 
 
-def build_locations(db: Database) -> tuple[list[Location], list[dict]]:
-    """調査する場所（優先順）と、自動では調べないドライブの一覧。"""
+def build_locations(db: Database, include_disabled: bool = False) -> tuple[list[Location], list[dict]]:
+    """調査する場所（優先順）と、自動では調べないドライブの一覧。
+
+    「調べる場所を選ぶ」でチェックを外した場所は、include_disabled=True のときだけ含める。
+    """
     locations: list[Location] = []
     seen: set[str] = set()
+    disabled = set() if include_disabled else {norm(p) for p in db.json_list("disabled_locations")}
 
     def add(path, kind, label):
-        if norm(path) not in seen and os.path.isdir(path):
+        if norm(path) not in seen and norm(path) not in disabled and os.path.isdir(path):
             seen.add(norm(path))
             locations.append(Location(path, kind, label, len(locations)))
 

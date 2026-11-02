@@ -26,6 +26,7 @@ from PIL import Image, ImageDraw, ImageFilter  # noqa: E402
 
 from storage_organizer import autoscan, candidates, media, trash  # noqa: E402
 from storage_organizer.db import Database  # noqa: E402
+from storage_organizer.formatting import format_size  # noqa: E402
 
 FFMPEG = media.find_ffmpeg()
 
@@ -423,7 +424,7 @@ class TrashTest(unittest.TestCase):
 
 
 try:
-    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtCore import QCoreApplication, QEvent, Qt
     from PySide6.QtWidgets import QApplication, QMessageBox
 except ImportError:
     QApplication = None
@@ -441,9 +442,13 @@ def wait_until(pred, timeout=60):
 
 @unittest.skipIf(QApplication is None, "PySide6 がありません")
 class OrganizerGuiTest(unittest.TestCase):
+    """改修した UI（ホーム・ファイル一覧・整理のおすすめ・詳細パネル・ステータス欄）。"""
+
     @classmethod
     def setUpClass(cls):
+        from storage_organizer import theme
         cls.app = QApplication.instance() or QApplication([])
+        theme.apply(cls.app)
 
     def setUp(self):
         from storage_organizer.main_window import MainWindow
@@ -454,8 +459,9 @@ class OrganizerGuiTest(unittest.TestCase):
         for p in self.mb:
             p.start()
         self.w = MainWindow(Database(self.env.data), start_autoscan=True)
+        self.w.resize(1280, 800)
         self.w.show()
-        self.page = self.w.organizer
+        self.state = self.w.state
 
     def tearDown(self):
         self.w.close()
@@ -465,92 +471,202 @@ class OrganizerGuiTest(unittest.TestCase):
             p.stop()
         self.env.close()
 
-    def wait_scan(self):
-        self.assertTrue(wait_until(lambda: self.page.runner.is_running(), 10))
-        self.assertTrue(wait_until(lambda: not self.page.runner.is_running(), 120))
+    def scan(self):
+        self.w.start_scan()
+        self.assertTrue(wait_until(lambda: self.state.runner.is_running(), 10))
+        self.assertTrue(wait_until(lambda: not self.state.runner.is_running(), 120))
         QCoreApplication.processEvents()
 
-    def test_auto_scan_and_categories(self):
-        self.wait_scan()  # フォルダ選択なしで自動的に始まる
-        page = self.page
-        self.assertGreater(page.model.rowCount(), 5)
-        self.assertIn("画像", page.totals_label.text())
-        self.assertIn("調べていません", page.status_label.text())  # すべて確認済みとは表示しない
-        self.assertNotIn("すべてを確認済み", page.status_label.text())
-        self.w.show_category("重複")
-        self.assertEqual(page.model.rowCount(), 1)
-        page.view.setCurrentIndex(page.model.index(0))
-        self.assertIs(page.right.currentWidget(), page.compare)
-        self.assertIn("完全重複", page.compare.header.text())
-        page.compare.keep_others_button.click()
-        db = page.db
-        decisions = sorted(r["decision"] or "" for r in db.media() if r["name"] in ("photo.jpg", "photo_copy.jpg")
-                           and r["id"] in page.ctx.dup_of)
-        self.assertEqual(decisions, ["削除候補", "残す"])
-        self.w.show_category("類似画像")
-        self.assertGreaterEqual(page.model.rowCount(), 1)
-        self.w.show_category("録画確認候補")
-        names = {it["name"] for it in page.model.items}
-        self.assertTrue({"trunc.jpg", "empty.jpg"} <= names)
-        # 1件を選ぶとプレビュー・詳細・理由・確認履歴
-        self.w.show_category("すべて")
-        i = next(i for i, it in enumerate(page.model.items) if it["name"] == "noexif.png")
-        page.view.setCurrentIndex(page.model.index(i))
-        self.assertIs(page.right.currentWidget(), page.detail)
-        self.assertIn("撮影日時: 不明", page.detail.info.text())
-        self.assertIsNotNone(db.video(page.model.items[i]["id"])["last_viewed"])
-        page.sort_combo.setCurrentText("撮影・録画日時が新しい順")
-        self.assertEqual(page.model.items[0]["taken_at"] is not None, True)
+    def select(self, browser, name):
+        i = next(i for i, it in enumerate(browser.model.items) if it["name"] == name)
+        browser.view.setCurrentIndex(browser.model.index(i, 0))
+        QCoreApplication.processEvents()
 
-    def test_decisions_target_and_trash_dialog(self):
+    def test_navigation_has_five_sections_and_reaches_all_pages(self):
+        w = self.w
+        self.assertEqual([w.nav.item(i).data(0x0100) for i in range(w.nav.count())],
+                         ["ホーム", "ファイル一覧", "整理のおすすめ", "動画AI", "設定"])
+        for page in (w.dashboard, w.video_list, w.initial, w.unclassified, w.curation, w.review,
+                     w.genre_page, w.duplicates, w.compress, w.scan_page, w.settings):
+            w.show_page(page)
+            QCoreApplication.processEvents()
+            self.assertTrue(page.isVisible(), f"{type(page).__name__} に到達できません")
+        for name in ("重複", "類似画像", "録画確認候補", "大容量", "削除候補"):
+            w.show_category(name)
+            self.assertIs(w.stack.currentWidget(), w.recommend)
+            self.assertEqual(w.recommend.category, name)
+        for name, state in (("保護", "保護中"), ("保留", "保留"), ("すべて", "すべての判断")):
+            w.show_category(name)
+            self.assertIs(w.stack.currentWidget(), w.files)
+            self.assertEqual(w.files.state_filter.currentText(), state)
+
+    def test_first_run_home_and_empty_states(self):
+        w = self.w
+        self.assertFalse(self.state.runner.is_running())  # 初回は自動で始めず、調べる場所を選んでもらう
+        self.assertEqual(w.home.primary.text(), "調べる場所を選ぶ")
+        self.assertEqual(w.home.total.value.text(), "未調査")
+        self.assertEqual(w.home.saving.value.text(), "算出できません")
+        self.assertIn("ドライブ全体の使用量ではありません", w.home.total.detail.text())
+        w.show_section(w.files)
+        self.assertIs(w.files.content.currentWidget(), w.files.empty)
+        self.assertEqual(w.files.empty.action.text(), "調べる場所を選ぶ")
+        self.assertIn("まだ調査していません", w.scan_status.text.text())
+        self.assertFalse(w.scan_status.pause.isVisible())
+        self.assertTrue(w.scan_status.rescan.isVisible())
+
+    def test_locations_dialog_controls_scan_targets(self):
+        from storage_organizer.organizer import LocationsDialog
+        dlg = LocationsDialog(self.w.ctx.db, self.w)
+        self.assertEqual(dlg.list.count(), 4)
+        for i in range(dlg.list.count()):
+            if "ダウンロード" in dlg.list.item(i).text():
+                dlg.list.item(i).setCheckState(Qt.CheckState.Unchecked)
+        dlg.save()
+        self.scan()
+        names = {r["name"] for r in self.w.ctx.db.media()}
+        self.assertNotIn("photo_copy.jpg", names)  # チェックを外した場所は調べない
+        self.assertIn("photo.jpg", names)
+
+    def test_home_after_scan(self):
+        self.scan()
+        home = self.w.home
+        total = sum(r["size"] for r in self.state.ctx.rows.values())
+        self.assertEqual(home.primary.text(), "整理をはじめる")
+        self.assertEqual(home.total.value.text(), format_size(total))
+        self.assertNotEqual(home.saving.value.text(), "算出できません")
+        self.assertIn("別の値", home.drive.detail.text())
+        home.primary.click()
+        self.assertIs(self.w.stack.currentWidget(), self.w.recommend)
+        self.assertIn("調査完了", self.w.scan_status.text.text())
+
+    def test_files_detail_selection_bar_and_views(self):
+        self.scan()
+        w = self.w
+        w.show_section(w.files)
+        f = w.files
+        self.assertFalse(f.detail.isVisible())  # 未選択のときは詳細を出さない
+        self.assertFalse(f.selection_bar.isVisible())
+        self.select(f, "noexif.png")
+        self.assertTrue(f.detail.isVisible())
+        self.assertTrue(f.selection_bar.isVisible())
+        self.assertEqual(f.detail.title.text(), "noexif.png")
+        self.assertIn("1 件を選択", f.selection_bar.count.text())
+        # 判断（削除候補にしても削除しない）
+        f.selection_bar.delete.click()
+        mid = next(r["id"] for r in w.ctx.db.media() if r["name"] == "noexif.png")
+        self.assertEqual(w.ctx.db.video(mid)["decision"], "削除候補")
+        self.assertTrue(os.path.exists(w.ctx.db.video(mid)["path"]))
+        self.assertNotEqual(f.selection_bar.delete.property("kind"), "danger")  # 赤はごみ箱だけ
+        f.selection_bar.protect.click()
+        self.assertTrue(w.ctx.db.video(mid)["protected"])
+        self.assertIsNone(w.ctx.db.video(mid)["decision"])  # 保護すると削除候補から外れる
+        # 複数選択
+        f.view.selectAll()
+        QCoreApplication.processEvents()
+        self.assertEqual(f.detail.stack.currentIndex(), 1)
+        self.assertIn(f"{len(f.model.items)} 件を選択", f.detail.title.text())
+        # カード表示とリスト表示の切り替え（選択を保つ）
+        self.select(f, "photo.jpg")
+        f.list_button.click()
+        self.assertIs(f.content.currentWidget(), f.table)
+        self.assertEqual(len(f.selected_ids()), 1)
+        f.grid_button.click()
+        # 閉じる
+        f.detail.closed.emit()
+        self.assertFalse(f.detail.isVisible())
+        self.assertFalse(f.selection_bar.isVisible())
+        # 検索結果なし → 理由と次の操作
+        f.search.setText("該当しない名前")
+        self.assertIs(f.content.currentWidget(), f.empty)
+        self.assertEqual(f.empty.action.text(), "条件をクリア")
+        f.empty.action.click()
+        self.assertEqual(f.search.text(), "")
+        f.kind_filter.setCurrentIndex(2)
+        self.assertTrue(all(it["kind"] == "video" for it in f.model.items))
+
+    def test_recommend_groups_compare_and_trash(self):
         from storage_organizer import organizer
-        self.wait_scan()
-        page = self.page
-        page.view.selectAll()
-        self.assertEqual(page.db.conn.execute("SELECT COUNT(*) FROM videos WHERE decision='削除候補'").fetchone()[0], 0)
-        # 目標容量から提案 → 選択を変えると見込みが更新
-        dlg = organizer.TargetDialog(page)
+        self.scan()
+        w = self.w
+        w.show_category("重複")
+        r = w.recommend
+        self.assertEqual(r.model.rowCount(), 1)
+        r.view.setCurrentIndex(r.model.index(0, 0))
+        QCoreApplication.processEvents()
+        self.assertFalse(r.selection_bar.delete.isVisible())  # グループ全体を一度に削除候補にしない
+        self.assertIs(r.detail.stack.currentWidget(), r.detail.compare_scroll)
+        self.assertTrue(wait_until(lambda: all(lb.pixmap() is not None and not lb.pixmap().isNull()
+                                               for lb in r.detail.compare.thumbs.values()), 20))
+        r.detail.compare.keep_others_button.click()
+        decisions = sorted(row["decision"] or "" for row in w.ctx.db.media()
+                           if row["id"] in self.state.ctx.dup_of)
+        self.assertEqual(decisions, ["削除候補", "残す"])
+        w.show_category("大容量")
+        self.assertIs(r.content.currentWidget(), r.empty)
+        self.assertIn("候補はありません", r.empty.title.text())
+        w.show_category("削除候補")
+        self.assertTrue(r.trash_button.isVisible())
+        self.assertEqual(r.trash_button.property("kind"), "danger")
+        ids = [row["id"] for row in w.ctx.db.media() if row["decision"] == "削除候補"]
+        moved = []
+
+        def fake_backend(path):  # 実際には削除しない
+            moved.append(path)
+            os.rename(path, path + ".trashed-by-test")
+        dlg = organizer.TrashDialog(w.ctx.db, ids, w, backend=fake_backend)
+        self.assertIn(f"{len(ids)} 件", dlg.summary.text())
+        dlg.execute()
+        self.assertEqual(len(moved), 1)
+        w.show_category("類似画像")
+        self.assertGreaterEqual(r.model.rowCount(), 1)
+
+    def test_target_dialog(self):
+        from storage_organizer import organizer
+        self.scan()
+        dlg = organizer.TargetDialog(self.w.recommend)
         dlg.target.setValue(0.0001)
         dlg.propose()
         self.assertGreater(dlg.table.rowCount(), 0)
         before = dlg.result.text()
-        dlg.table.item(0, 0).setCheckState(organizer.Qt.CheckState.Unchecked)
+        dlg.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
         self.assertNotEqual(dlg.result.text(), before)
         dlg.target.setValue(100000)
         dlg.propose()
         self.assertIn("不足", dlg.result.text())
-        dlg.apply()
-        self.assertTrue(page.db.conn.execute("SELECT COUNT(*) FROM videos WHERE decision='削除候補'").fetchone()[0])
-        # 確認画面: 件数・合計容量 → モックのごみ箱へ移動
-        ids = [r["id"] for r in page.db.media() if r["decision"] == "削除候補"]
-        moved = []
 
-        def fake_backend(path):
-            moved.append(path)
-            os.rename(path, path + ".trashed-by-test")
-        tdlg = organizer.TrashDialog(page.db, ids, page, backend=fake_backend)
-        self.assertIn(f"{len(ids)} 件", tdlg.summary.text())
-        self.assertIn("ごみ箱を空にするまで", tdlg.summary.text())
-        tdlg.table.item(0, 0).setCheckState(organizer.Qt.CheckState.Unchecked)
-        tdlg.execute()
-        self.assertEqual(len(moved), len([r for r in tdlg.results if r.ok]))
-        self.assertLessEqual(len(moved), len(ids) - 1)
-        page.refresh()
-        # 調査範囲: 除外した場所・調べていないドライブ
-        scope = organizer.ScopeDialog(page.db, page)
-        self.assertGreater(scope.excluded.rowCount(), 0)
-        self.assertEqual(scope.locations.rowCount(), 4)
+    def test_status_while_scanning(self):
+        w = self.w
+        w.start_scan()
+        self.assertTrue(wait_until(lambda: self.state.runner.is_running(), 10))
+        QCoreApplication.processEvents()
+        st = w.scan_status
+        self.assertTrue(st.pause.isVisible() and st.cancel.isVisible())
+        self.assertFalse(st.rescan.isEnabled())
+        st.pause.click()
+        self.assertTrue(self.state.runner.ctl.paused)
+        self.assertEqual(st.pause.text(), "再開")
+        self.assertIn("一時停止中", st.text.text())
+        st.pause.click()
+        st.cancel.click()
+        self.assertTrue(wait_until(lambda: not self.state.runner.is_running(), 60))
+        QCoreApplication.processEvents()
+        self.assertFalse(st.pause.isVisible())
+        self.assertTrue(st.rescan.isEnabled())
 
-    def test_pause_resume_buttons(self):
-        page = self.page
-        self.assertTrue(wait_until(lambda: page.runner.is_running(), 10))
-        page.pause_button.click()
-        self.assertTrue(page.runner.ctl.paused)
-        self.assertEqual(page.pause_button.text(), "再開")
-        page.pause_button.click()
-        self.assertFalse(page.runner.ctl.paused)
-        page.cancel_button.click()
-        self.assertTrue(wait_until(lambda: not page.runner.is_running(), 60))
+    def test_small_screens_keep_main_actions_reachable(self):
+        self.scan()
+        w = self.w
+        for size in ((1093, 614), (911, 512)):  # 1366×768 の表示倍率 125% / 150%
+            w.resize(*size)
+            w.show_section(w.files)
+            self.select(w.files, "photo.jpg")
+            QCoreApplication.processEvents()
+            bar = w.files.selection_bar
+            for b in (bar.keep, bar.hold, bar.delete, bar.protect, bar.more):
+                self.assertTrue(b.isVisible())
+                self.assertGreaterEqual(b.width(), b.sizeHint().width() - 2, f"{b.text()} が切れています")
+            self.assertTrue(w.scan_status.rescan.isVisible())
+            self.assertLessEqual(w.files.detail.width(), w.files.width())
 
 
 if __name__ == "__main__":

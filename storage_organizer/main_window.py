@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
+    QTabWidget,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -26,7 +28,8 @@ from . import pages
 from .db import Database
 from .file_table_model import COL_CATEGORY, COL_MTIME, COL_NAME, COL_SIZE, FileTableModel
 from .formatting import format_bytes_exact, format_duration, format_size
-from .organizer import OrganizerPage
+from . import theme
+from .organizer import HomePage, LocationsDialog, MediaBrowser, MediaState, ScanStatus
 from .scan_worker import ScanWorker
 from .scanner import ScanProgress, ScanResult
 
@@ -276,18 +279,82 @@ class ScanPage(QWidget):
 # =============================================================================
 # メインウィンドウ
 # =============================================================================
-ORGANIZER_CATEGORIES = ["すべて", "重複", "類似画像", "録画確認候補", "大容量", "保護", "保留", "削除候補"]
+NAV_ITEMS = [("home", "ホーム"), ("files", "ファイル一覧"), ("sparkle", "整理のおすすめ"), ("video", "動画AI"),
+             ("settings", "設定")]
+RECOMMEND_KEYS = ["重複", "類似画像", "録画確認候補", "大容量", "削除候補"]
+
+
+class TitledPage(QWidget):
+    """タイトルと説明を付けて既存の画面を包む。"""
+
+    def __init__(self, title: str, caption: str, inner: QWidget) -> None:
+        super().__init__()
+        self.setObjectName("Page")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(theme.S3, theme.S2, theme.S3, theme.S1)
+        v.setSpacing(theme.S1)
+        t = QLabel(title)
+        theme.set_role(t, "title")
+        c = QLabel(caption)
+        theme.set_role(c, "sub")
+        c.setWordWrap(True)
+        v.addWidget(t)
+        v.addWidget(c)
+        v.addWidget(inner, 1)
+        self.inner = inner
+
+
+class VideoAIPage(QWidget):
+    """動画AI（ジャンル分類・初期学習・未分類・厳選・圧縮など）をまとめた画面。動画詳細は一覧から開く。"""
+
+    def __init__(self, tabs: list[tuple[str, QWidget]], detail: QWidget) -> None:
+        super().__init__()
+        self.setObjectName("Page")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(theme.S3, theme.S2, theme.S3, theme.S1)
+        v.setSpacing(theme.S1)
+        t = QLabel("動画AI（試作）")
+        theme.set_role(t, "title")
+        c = QLabel("動画のジャンル分類と厳選を学習する試作機能です。動画の詳細は「動画一覧」でダブルクリックして開きます。")
+        theme.set_role(c, "sub")
+        c.setWordWrap(True)
+        v.addWidget(t)
+        v.addWidget(c)
+        self.stack = QStackedWidget()
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setUsesScrollButtons(True)
+        for name, w in tabs:
+            self.tabs.addTab(w, name)
+        self.detail = detail
+        self.stack.addWidget(self.tabs)
+        self.stack.addWidget(detail)
+        v.addWidget(self.stack, 1)
+
+    def show_widget(self, widget: QWidget) -> None:
+        if widget is self.detail:
+            self.stack.setCurrentWidget(self.detail)
+        else:
+            self.stack.setCurrentWidget(self.tabs)
+            self.tabs.setCurrentWidget(widget)
+
+    def current_page(self) -> QWidget:
+        return self.detail if self.stack.currentWidget() is self.detail else self.tabs.currentWidget()
 
 
 class MainWindow(QMainWindow):
     def __init__(self, db: Database | None = None, start_autoscan: bool = True) -> None:
         super().__init__()
-        self.setWindowTitle("録画・画像の整理支援（RecSort AI 試作）")
-        self.resize(1360, 860)
+        self.setWindowTitle("RecSort — 録画・画像の整理支援")
+        self.resize(1280, 800)
+        self.setMinimumSize(880, 520)
         self.ask_initial_learning = True  # 従来のフォルダ指定スキャン後に初期学習を案内するか（テストでは False）
         self.ctx = pages.AppContext(db or Database())
         c = self.ctx
-        self.organizer = OrganizerPage(c.db, c.tools)
+        self.state = MediaState(c.db, c.tools)
+        self.home = HomePage(self.state)
+        self.files = MediaBrowser(self.state, "files")
+        self.recommend = MediaBrowser(self.state, "recommend")
         self.scan_page = ScanPage()
         self.dashboard = pages.DashboardPage(c)
         self.video_list = pages.VideoListPage(c)
@@ -300,74 +367,127 @@ class MainWindow(QMainWindow):
         self.duplicates = pages.DuplicatePage(c)
         self.compress = pages.CompressPage(c)
         self.settings = pages.SettingsPage(c)
-        # 左のメニュー: (見出し) / (整理の分類) / (画面)
-        nav_spec = [("header", "整理"), *[("category", name) for name in ORGANIZER_CATEGORIES],
-                    ("header", "動画AI（試作）"),
-                    ("page", "ダッシュボード", self.dashboard), ("page", "動画一覧", self.video_list),
-                    ("page", "動画詳細", self.detail), ("page", "ジャンル管理", self.genre_page),
-                    ("page", "初期AI学習", self.initial), ("page", "未分類動画", self.unclassified),
-                    ("page", "厳選", self.curation), ("page", "再確認待ち", self.review),
-                    ("page", "動画の重複グループ", self.duplicates), ("page", "圧縮", self.compress),
-                    ("header", "その他"),
-                    ("page", "フォルダ指定の容量調査", self.scan_page), ("page", "設定", self.settings)]
-        self.page_widgets = [self.organizer] + [spec[2] for spec in nav_spec if spec[0] == "page"]
+        self.video_ai = VideoAIPage([
+            ("概要", self.dashboard), ("動画一覧", self.video_list), ("初期学習", self.initial),
+            ("未分類", self.unclassified), ("厳選", self.curation), ("再確認待ち", self.review),
+            ("ジャンル管理", self.genre_page), ("動画の重複", self.duplicates), ("圧縮", self.compress),
+            ("フォルダから登録", self.scan_page)], self.detail)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setWidget(self.settings)
+        self.settings_page = TitledPage("設定", "FFmpeg の場所、自動スキャンの対象・対象外、AI のリセットなど。",
+                                        settings_scroll)
+        self.sections = [self.home, self.files, self.recommend, self.video_ai, self.settings_page]
+        self.page_widgets = self.sections
 
         central = QWidget()
-        outer = QVBoxLayout(central)
-        body = QHBoxLayout()
+        central.setObjectName("Page")
+        body = QHBoxLayout(central)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        side = QWidget()
+        sv = QVBoxLayout(side)
+        sv.setContentsMargins(theme.S1, theme.S2, theme.S1, theme.S1)
+        self.brand = QLabel("RecSort")
+        theme.set_role(self.brand, "subtitle")
+        self.brand.setContentsMargins(theme.S1, 0, 0, theme.S1)
         self.nav = QListWidget()
-        self.nav.setFixedWidth(170)
-        self._nav_targets: list = []
-        for spec in nav_spec:
-            if spec[0] == "header":
-                item = QListWidgetItem(spec[1])
-                item.setFlags(Qt.ItemFlag.NoItemFlags)
-                font = item.font()
-                font.setBold(True)
-                item.setFont(font)
-                self._nav_targets.append(None)
-            elif spec[0] == "category":
-                item = QListWidgetItem("　" + spec[1])
-                self._nav_targets.append(("category", spec[1]))
-            else:
-                item = QListWidgetItem("　" + spec[1])
-                self._nav_targets.append(("page", spec[2]))
+        self.nav.setObjectName("Nav")
+        self.nav.setIconSize(QSize(20, 20))
+        self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        for icon_name, text in NAV_ITEMS:
+            item = QListWidgetItem(theme.icon(icon_name, theme.TEXT, 20), text)
+            item.setToolTip(text)
+            item.setData(Qt.ItemDataRole.UserRole, text)
             self.nav.addItem(item)
+        sv.addWidget(self.brand)
+        sv.addWidget(self.nav, 1)
+        self.side = side
         self.stack = QStackedWidget()
-        for w in self.page_widgets:
+        for w in self.sections:
             self.stack.addWidget(w)
-        body.addWidget(self.nav)
+        body.addWidget(side)
         body.addWidget(self.stack, 1)
-        outer.addLayout(body, 1)
-        self.task_bar = pages.TaskBar(c)
-        outer.addWidget(self.task_bar)
         self.setCentralWidget(central)
+        self.scan_status = ScanStatus(self.state)
+        self.task_bar = pages.TaskBar(c)
+        self.statusBar().addWidget(self.scan_status, 1)
+        self.statusBar().addPermanentWidget(self.task_bar)
+        self.statusBar().setSizeGripEnabled(False)
+        self._compact = None
+        self._apply_compact(self.width() < 1100)
 
         self.nav.currentRowChanged.connect(self._on_nav)
+        self.scan_status.rescan.clicked.connect(self.start_scan)
+        self.home.start_organizing.connect(self.show_category)
+        for w in (self.home, self.files, self.recommend):
+            w.request_locations.connect(self.open_locations)
+        self.home.request_files.connect(lambda: self.show_section(self.files))
+        self.recommend.request_files.connect(lambda: self.show_section(self.files))
+        self.files.request_files.connect(lambda: self.show_section(self.files))
         self.scan_page.scan_completed.connect(self._on_scan_completed)
         c.open_video_requested.connect(self.open_video)
         c.open_compress_requested.connect(self.open_compress)
         self.detail.back_requested.connect(lambda: self.show_page(self.video_list))
-        self.organizer.runner.finished.connect(lambda _: c.data_changed.emit())
-        self.show_category("すべて")
-        if start_autoscan and c.db.get_setting("auto_scan_on_start", "1") != "0":
-            QTimer.singleShot(300, self.organizer.start_scan)  # 前回の結果を表示してから更新を始める
+        self.state.runner.finished.connect(lambda _: c.data_changed.emit())
+        self.nav.setCurrentRow(0)
+        # 初回（一度も調査していない）は「調べる場所を選ぶ」から始める。2回目以降は起動時に自動で更新する
+        if (start_autoscan and c.db.get_setting("auto_scan_on_start", "1") != "0"
+                and c.db.get_setting("scan_gen") is not None):
+            QTimer.singleShot(300, self.start_scan)
 
+    # --- 画面の切り替え -------------------------------------------------------
     def _on_nav(self, row: int) -> None:
-        target = self._nav_targets[row] if 0 <= row < len(self._nav_targets) else None
-        if target is None:
-            return
-        if target[0] == "category":
-            self.stack.setCurrentWidget(self.organizer)
-            self.organizer.set_category(target[1])
-        else:
-            self.stack.setCurrentWidget(target[1])
+        if 0 <= row < len(self.sections):
+            self.stack.setCurrentWidget(self.sections[row])
+            if self.sections[row] is not self.files:
+                self.files.stop_media()
+            if self.sections[row] is not self.recommend:
+                self.recommend.stop_media()
 
-    def show_category(self, name: str) -> None:
-        self.nav.setCurrentRow(self._nav_targets.index(("category", name)))
+    def show_section(self, widget) -> None:
+        self.nav.setCurrentRow(self.sections.index(widget))
 
     def show_page(self, widget) -> None:
-        self.nav.setCurrentRow(self._nav_targets.index(("page", widget)))
+        """既存の画面へ移動する（動画AIの各画面・設定・整理画面）。"""
+        if widget in self.sections:
+            self.show_section(widget)
+        elif widget is self.settings:
+            self.show_section(self.settings_page)
+        else:
+            self.video_ai.show_widget(widget)
+            self.show_section(self.video_ai)
+
+    def show_category(self, name: str) -> None:
+        """整理の分類（重複・類似画像など）やファイルの判断状態へ移動する。"""
+        if name in RECOMMEND_KEYS:
+            self.recommend.set_category(name)
+            self.show_section(self.recommend)
+        else:
+            self.files.set_category(name)
+            self.show_section(self.files)
+
+    def open_locations(self) -> None:
+        if LocationsDialog(self.ctx.db, self).exec():
+            self.start_scan()
+
+    def start_scan(self) -> None:
+        self.state.start_scan()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_compact(self.width() < 1100)
+
+    def _apply_compact(self, compact: bool) -> None:
+        """画面幅が狭いときは左メニューをアイコンだけにする。"""
+        if compact == self._compact:
+            return
+        self._compact = compact
+        self.side.setFixedWidth(64 if compact else 200)
+        self.brand.setText("" if compact else "RecSort")
+        for i in range(self.nav.count()):
+            item = self.nav.item(i)
+            item.setText("" if compact else item.data(Qt.ItemDataRole.UserRole))
 
     def open_video(self, video_id: int) -> None:
         self.detail.load(video_id)
@@ -403,7 +523,9 @@ class MainWindow(QMainWindow):
                 self.ctx.data_changed.emit()
 
     def closeEvent(self, event) -> None:
-        self.organizer.shutdown()
+        self.files.stop_media()
+        self.recommend.stop_media()
+        self.state.close()
         self.scan_page.shutdown()
         self.ctx.shutdown()
         for page in (self.detail, self.initial, self.compress):
