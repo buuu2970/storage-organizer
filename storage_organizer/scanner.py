@@ -27,6 +27,8 @@ _IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # ジャンクション / マウント
 _IO_REPARSE_TAG_SYMLINK = 0xA000000C  # シンボリックリンク
 _LINK_REPARSE_TAGS = frozenset({_IO_REPARSE_TAG_MOUNT_POINT, _IO_REPARSE_TAG_SYMLINK})
 _FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+# OneDrive などで「クラウド上のみ」にあるファイルの属性。中身を読むとダウンロードが始まる
+_CLOUD_ONLY_ATTRIBUTES = 0x00400000 | 0x00040000 | 0x00001000  # RECALL_ON_DATA_ACCESS / RECALL_ON_OPEN / OFFLINE
 
 # 詳細表示用に保持するスキップ場所の最大数（件数自体は上限なしで数える）
 MAX_SKIPPED_DETAILS = 200
@@ -41,6 +43,7 @@ class FileRecord:
     category: str
     mtime: float  # 最終更新日時（UNIX時刻）
     folder: str  # 保存場所（親フォルダのパス）
+    cloud_only: bool = False  # クラウド上のみ（中身を読む処理の対象外にする）
 
     @property
     def path(self) -> str:
@@ -95,6 +98,10 @@ def is_link(entry: os.DirEntry) -> bool:
             if getattr(st, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS:
                 return True
     return False
+
+
+def is_cloud_only(st: os.stat_result) -> bool:
+    return bool(getattr(st, "st_file_attributes", 0) & _CLOUD_ONLY_ATTRIBUTES)
 
 
 def scan(
@@ -184,6 +191,7 @@ def scan(
                         category=categorize(entry.name),
                         mtime=st.st_mtime,
                         folder=current_dir,
+                        cloud_only=is_cloud_only(st),
                     )
                 )
                 result.files += 1

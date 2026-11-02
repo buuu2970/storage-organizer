@@ -93,5 +93,8 @@ class FileTableModel(QAbstractTableModel):
         self._rows = []
         self.endResetModel()
 
+    def records(self) -> list[FileRecord]:
+        return list(self._rows)
+
     def record_at(self, row: int) -> FileRecord:
         return self._rows[row]

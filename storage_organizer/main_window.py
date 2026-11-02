@@ -1,8 +1,8 @@
-"""メインウィンドウ。"""
+"""メインウィンドウと「ファイル調査」ページ（既存のスキャン画面）。"""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread, Slot
+from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -10,15 +10,19 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QStackedWidget,
     QTableView,
     QVBoxLayout,
     QWidget,
 )
 
+from . import pages
+from .db import Database
 from .file_table_model import COL_CATEGORY, COL_MTIME, COL_NAME, COL_SIZE, FileTableModel
 from .formatting import format_bytes_exact, format_duration, format_size
 from .scan_worker import ScanWorker
@@ -52,11 +56,13 @@ class ElidedLabel(QLabel):
                                         max(self.width(), 100)))
 
 
-class MainWindow(QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle("ストレージ整理支援 - フォルダ容量調査")
-        self.resize(1100, 700)
+class ScanPage(QWidget):
+    """フォルダを選んでサブフォルダまでスキャンし、ファイルを一覧表示する（既存機能）。"""
+
+    scan_completed = Signal(object, object)  # ScanResult, list[FileRecord]
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
 
         self._selected_folder: str | None = None
         self._thread: QThread | None = None
@@ -68,8 +74,8 @@ class MainWindow(QMainWindow):
 
     # --- 画面構築 -------------------------------------------------------
     def _build_ui(self) -> None:
-        central = QWidget(self)
-        layout = QVBoxLayout(central)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         # 1行目: フォルダ選択とスキャン操作
         top = QHBoxLayout()
@@ -128,7 +134,6 @@ class MainWindow(QMainWindow):
         note.setStyleSheet("color: gray;")
         layout.addWidget(note)
 
-        self.setCentralWidget(central)
         self._update_summary(files=0, total_size=0, skipped=0, links=0)
 
     # --- 状態切り替え ---------------------------------------------------
@@ -216,6 +221,7 @@ class MainWindow(QMainWindow):
         # 完了後は容量の大きい順に並べる
         self.table.horizontalHeader().setSortIndicator(COL_SIZE, Qt.SortOrder.DescendingOrder)
         self.table.setSortingEnabled(True)
+        self.scan_completed.emit(result, self.model.records())
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:
@@ -257,10 +263,108 @@ class MainWindow(QMainWindow):
         self.summary_label.setToolTip("\n".join(tooltip))
 
     # --- 終了処理 -------------------------------------------------------
-    def closeEvent(self, event) -> None:
+    def shutdown(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait(5000)
+
+
+# =============================================================================
+# メインウィンドウ
+# =============================================================================
+PAGE_TITLES = ["ダッシュボード", "ファイル調査", "動画一覧", "動画詳細", "ジャンル管理", "初期AI学習",
+               "未分類動画", "厳選", "再確認待ち", "重複グループ", "圧縮", "設定"]
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, db: Database | None = None) -> None:
+        super().__init__()
+        self.setWindowTitle("RecSort AI（試作） - 録画整理支援")
+        self.resize(1280, 800)
+        self.ask_initial_learning = True  # スキャン後に初期学習を案内するか（テストでは False）
+        self.ctx = pages.AppContext(db or Database())
+        c = self.ctx
+        self.scan_page = ScanPage()
+        self.dashboard = pages.DashboardPage(c)
+        self.video_list = pages.VideoListPage(c)
+        self.detail = pages.VideoDetailPage(c)
+        self.genre_page = pages.GenrePage(c)
+        self.initial = pages.InitialLearningPage(c)
+        self.unclassified = pages.UnclassifiedPage(c)
+        self.curation = pages.CurationPage(c)
+        self.review = pages.ReviewPage(c)
+        self.duplicates = pages.DuplicatePage(c)
+        self.compress = pages.CompressPage(c)
+        self.settings = pages.SettingsPage(c)
+        self.page_widgets = [self.dashboard, self.scan_page, self.video_list, self.detail,
+                             self.genre_page, self.initial, self.unclassified, self.curation,
+                             self.review, self.duplicates, self.compress, self.settings]
+
+        central = QWidget()
+        outer = QVBoxLayout(central)
+        body = QHBoxLayout()
+        self.nav = QListWidget()
+        self.nav.addItems(PAGE_TITLES)
+        self.nav.setFixedWidth(150)
+        self.stack = QStackedWidget()
+        for w in self.page_widgets:
+            self.stack.addWidget(w)
+        body.addWidget(self.nav)
+        body.addWidget(self.stack, 1)
+        outer.addLayout(body, 1)
+        self.task_bar = pages.TaskBar(c)
+        outer.addWidget(self.task_bar)
+        self.setCentralWidget(central)
+
+        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.scan_page.scan_completed.connect(self._on_scan_completed)
+        c.open_video_requested.connect(self.open_video)
+        c.open_compress_requested.connect(self.open_compress)
+        self.detail.back_requested.connect(lambda: self.show_page(self.video_list))
+        self.nav.setCurrentRow(0)
+
+    def show_page(self, widget) -> None:
+        self.nav.setCurrentRow(self.page_widgets.index(widget))
+
+    def open_video(self, video_id: int) -> None:
+        self.detail.load(video_id)
+        self.show_page(self.detail)
+
+    def open_compress(self, video_id: int) -> None:
+        self.compress.select_video(video_id)
+        self.show_page(self.compress)
+
+    def _on_scan_completed(self, result, records) -> None:
+        videos = [r for r in records if r.category == "動画"]
+        added, invalidated = self.ctx.db.register_videos(
+            videos, result.root, complete_scan=not result.cancelled and result.skipped == 0)
+        self.ctx.data_changed.emit()
+        note = f"動画 {len(videos)} 本を登録しました（新規 {added} 本"
+        note += f"、内容が変わったため解析をやり直す動画 {invalidated} 本）" if invalidated else "）"
+        self.scan_page.current_dir_label.set_full_text(
+            self.scan_page.current_dir_label.toolTip() + "  /  " + note)
+        if (videos and self.ask_initial_learning
+                and self.ctx.db.get_setting("initial_state") is None):
+            box = QMessageBox(self)
+            box.setWindowTitle("初期AI学習")
+            box.setText("あなたの動画の分類方法をAIに教えませんか？\n"
+                        "特徴の異なる動画を最大5本選ぶので、ジャンルを付けてください。")
+            start = box.addButton("初期学習を開始", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("今はスキップ", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is start:
+                self.show_page(self.initial)
+                self.initial.start()
+            else:
+                self.ctx.db.set_setting("initial_state", "skipped")
+                self.ctx.data_changed.emit()
+
+    def closeEvent(self, event) -> None:
+        self.scan_page.shutdown()
+        self.ctx.shutdown()
+        for page in (self.detail, self.initial, self.compress):
+            page.player.stop()
+        self.ctx.db.close()
         super().closeEvent(event)
