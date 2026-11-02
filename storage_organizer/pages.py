@@ -1752,6 +1752,29 @@ class SettingsPage(BasePage):
         layout.addWidget(reset)
         layout.addWidget(model_reset)
         model_reset.clicked.connect(lambda: open_reset_dialog(self.ctx, self))
+        scan_box = QGroupBox("自動スキャン（変更は次回のスキャンから反映。「再スキャン」ですぐ反映できます）")
+        sv = QVBoxLayout(scan_box)
+        self.auto_start = QCheckBox("起動時に自動でスキャンする")
+        sv.addWidget(self.auto_start)
+        self.path_lists = {}
+        for key, title in (("excluded_folders", "スキャン対象外のフォルダ"),
+                           ("extra_locations", "追加で調べる場所（外付け・ネットワークドライブやフォルダ）")):
+            sv.addWidget(QLabel(title))
+            lst = QListWidget()
+            lst.setMaximumHeight(90)
+            row = QHBoxLayout()
+            add, remove = QPushButton("追加…"), QPushButton("削除")
+            add.clicked.connect(partial(self._add_path, key))
+            remove.clicked.connect(partial(self._remove_path, key))
+            row.addWidget(add)
+            row.addWidget(remove)
+            row.addStretch()
+            sv.addWidget(lst)
+            sv.addLayout(row)
+            self.path_lists[key] = lst
+        self.auto_start.toggled.connect(
+            lambda on: self.ctx.db.set_setting("auto_scan_on_start", "1" if on else "0"))
+        layout.addWidget(scan_box)
         layout.addWidget(note_label(
             "AIの実装範囲: 実装済み＝映像（明るさ・黒画面・静止・動き・色）と音声（音量・無音率・簡易な音質）の"
             "数値特徴、教師データとの類似度による複数ジャンル推定、未分類判定、手動再学習、"
@@ -1764,7 +1787,27 @@ class SettingsPage(BasePage):
         save.clicked.connect(self._save)
         reset.clicked.connect(self._reset)
 
+    def _add_path(self, key: str, path: str | None = None) -> None:
+        path = path or QFileDialog.getExistingDirectory(self, "フォルダ・ドライブを選択")
+        if path:
+            values = self.ctx.db.json_list(key)
+            if path not in values:
+                self.ctx.db.set_json_list(key, values + [path])
+            self.refresh()
+
+    def _remove_path(self, key: str) -> None:
+        item = self.path_lists[key].currentItem()
+        if item:
+            self.ctx.db.set_json_list(key, [p for p in self.ctx.db.json_list(key) if p != item.text()])
+            self.refresh()
+
     def refresh(self):
+        for key, lst in self.path_lists.items():
+            lst.clear()
+            lst.addItems(self.ctx.db.json_list(key))
+        self.auto_start.blockSignals(True)
+        self.auto_start.setChecked(self.ctx.db.get_setting("auto_scan_on_start", "1") != "0")
+        self.auto_start.blockSignals(False)
         self.ffmpeg_dir.setText(self.ctx.db.get_setting("ffmpeg_dir", "") or "")
         self.frames.setValue(self.ctx.max_frames())
         self.data_label.setText(str(self.ctx.data_dir))

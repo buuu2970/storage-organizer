@@ -46,7 +46,7 @@ class MainWindowTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self._data = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self.window = MainWindow(Database(self._data.name))
+        self.window = MainWindow(Database(self._data.name), start_autoscan=False)
         self.window.ask_initial_learning = False
         self.window.show()
         self.window.show_page(self.window.scan_page)
@@ -192,7 +192,7 @@ class RecSortGuiTest(unittest.TestCase):
         self.assertEqual(_snapshot(self.video_root), self.before, "元の動画が変更されました")
 
     def _new_window(self):
-        w = MainWindow(Database(self._data.name))
+        w = MainWindow(Database(self._data.name), start_autoscan=False)
         w.ask_initial_learning = False
         w.show()
         return w

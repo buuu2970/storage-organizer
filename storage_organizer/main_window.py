@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -25,6 +26,7 @@ from . import pages
 from .db import Database
 from .file_table_model import COL_CATEGORY, COL_MTIME, COL_NAME, COL_SIZE, FileTableModel
 from .formatting import format_bytes_exact, format_duration, format_size
+from .organizer import OrganizerPage
 from .scan_worker import ScanWorker
 from .scanner import ScanProgress, ScanResult
 
@@ -274,18 +276,18 @@ class ScanPage(QWidget):
 # =============================================================================
 # メインウィンドウ
 # =============================================================================
-PAGE_TITLES = ["ダッシュボード", "ファイル調査", "動画一覧", "動画詳細", "ジャンル管理", "初期AI学習",
-               "未分類動画", "厳選", "再確認待ち", "重複グループ", "圧縮", "設定"]
+ORGANIZER_CATEGORIES = ["すべて", "重複", "類似画像", "録画確認候補", "大容量", "保護", "保留", "削除候補"]
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, db: Database | None = None, start_autoscan: bool = True) -> None:
         super().__init__()
-        self.setWindowTitle("RecSort AI（試作） - 録画整理支援")
-        self.resize(1280, 800)
-        self.ask_initial_learning = True  # スキャン後に初期学習を案内するか（テストでは False）
+        self.setWindowTitle("録画・画像の整理支援（RecSort AI 試作）")
+        self.resize(1360, 860)
+        self.ask_initial_learning = True  # 従来のフォルダ指定スキャン後に初期学習を案内するか（テストでは False）
         self.ctx = pages.AppContext(db or Database())
         c = self.ctx
+        self.organizer = OrganizerPage(c.db, c.tools)
         self.scan_page = ScanPage()
         self.dashboard = pages.DashboardPage(c)
         self.video_list = pages.VideoListPage(c)
@@ -298,16 +300,39 @@ class MainWindow(QMainWindow):
         self.duplicates = pages.DuplicatePage(c)
         self.compress = pages.CompressPage(c)
         self.settings = pages.SettingsPage(c)
-        self.page_widgets = [self.dashboard, self.scan_page, self.video_list, self.detail,
-                             self.genre_page, self.initial, self.unclassified, self.curation,
-                             self.review, self.duplicates, self.compress, self.settings]
+        # 左のメニュー: (見出し) / (整理の分類) / (画面)
+        nav_spec = [("header", "整理"), *[("category", name) for name in ORGANIZER_CATEGORIES],
+                    ("header", "動画AI（試作）"),
+                    ("page", "ダッシュボード", self.dashboard), ("page", "動画一覧", self.video_list),
+                    ("page", "動画詳細", self.detail), ("page", "ジャンル管理", self.genre_page),
+                    ("page", "初期AI学習", self.initial), ("page", "未分類動画", self.unclassified),
+                    ("page", "厳選", self.curation), ("page", "再確認待ち", self.review),
+                    ("page", "動画の重複グループ", self.duplicates), ("page", "圧縮", self.compress),
+                    ("header", "その他"),
+                    ("page", "フォルダ指定の容量調査", self.scan_page), ("page", "設定", self.settings)]
+        self.page_widgets = [self.organizer] + [spec[2] for spec in nav_spec if spec[0] == "page"]
 
         central = QWidget()
         outer = QVBoxLayout(central)
         body = QHBoxLayout()
         self.nav = QListWidget()
-        self.nav.addItems(PAGE_TITLES)
-        self.nav.setFixedWidth(150)
+        self.nav.setFixedWidth(170)
+        self._nav_targets: list = []
+        for spec in nav_spec:
+            if spec[0] == "header":
+                item = QListWidgetItem(spec[1])
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                self._nav_targets.append(None)
+            elif spec[0] == "category":
+                item = QListWidgetItem("　" + spec[1])
+                self._nav_targets.append(("category", spec[1]))
+            else:
+                item = QListWidgetItem("　" + spec[1])
+                self._nav_targets.append(("page", spec[2]))
+            self.nav.addItem(item)
         self.stack = QStackedWidget()
         for w in self.page_widgets:
             self.stack.addWidget(w)
@@ -318,15 +343,31 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.task_bar)
         self.setCentralWidget(central)
 
-        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self._on_nav)
         self.scan_page.scan_completed.connect(self._on_scan_completed)
         c.open_video_requested.connect(self.open_video)
         c.open_compress_requested.connect(self.open_compress)
         self.detail.back_requested.connect(lambda: self.show_page(self.video_list))
-        self.nav.setCurrentRow(0)
+        self.organizer.runner.finished.connect(lambda _: c.data_changed.emit())
+        self.show_category("すべて")
+        if start_autoscan and c.db.get_setting("auto_scan_on_start", "1") != "0":
+            QTimer.singleShot(300, self.organizer.start_scan)  # 前回の結果を表示してから更新を始める
+
+    def _on_nav(self, row: int) -> None:
+        target = self._nav_targets[row] if 0 <= row < len(self._nav_targets) else None
+        if target is None:
+            return
+        if target[0] == "category":
+            self.stack.setCurrentWidget(self.organizer)
+            self.organizer.set_category(target[1])
+        else:
+            self.stack.setCurrentWidget(target[1])
+
+    def show_category(self, name: str) -> None:
+        self.nav.setCurrentRow(self._nav_targets.index(("category", name)))
 
     def show_page(self, widget) -> None:
-        self.nav.setCurrentRow(self.page_widgets.index(widget))
+        self.nav.setCurrentRow(self._nav_targets.index(("page", widget)))
 
     def open_video(self, video_id: int) -> None:
         self.detail.load(video_id)
@@ -362,6 +403,7 @@ class MainWindow(QMainWindow):
                 self.ctx.data_changed.emit()
 
     def closeEvent(self, event) -> None:
+        self.organizer.shutdown()
         self.scan_page.shutdown()
         self.ctx.shutdown()
         for page in (self.detail, self.initial, self.compress):

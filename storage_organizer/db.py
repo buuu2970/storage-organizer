@@ -25,6 +25,23 @@ DEFAULT_TAGS = [
 ]
 
 ANALYSIS_STATES = ("未解析", "解析中", "完了", "一部失敗", "失敗")
+DECISIONS = ("残す", "削除候補", "保留")  # 整理画面での判断（「絶対に残す」は protected 列）
+
+# 整理画面（画像・動画）のために videos テーブルへ追加する列。テーブル名は互換性のため videos のまま
+_MEDIA_COLUMNS = [
+    ("kind", "TEXT NOT NULL DEFAULT 'video'"),   # video / image
+    ("location", "TEXT"),                        # どの調査場所で見つかったか
+    ("seen_gen", "INTEGER NOT NULL DEFAULT 0"),  # 最後に見つかったスキャン回
+    ("taken_at", "REAL"),                        # 撮影・録画日時（取得できない場合は NULL＝不明）
+    ("dhash", "TEXT"),                           # 類似画像判定用の知覚ハッシュ
+    ("similar_group", "INTEGER"),
+    ("light_state", "TEXT NOT NULL DEFAULT '未解析'"),  # 整理用の軽い解析: 未解析 / 完了 / 対象外 / 読み込みエラー
+    ("light_note", "TEXT"),
+    ("failure", "TEXT"),                         # JSON: 失敗した可能性の理由 [{"kind","reason"}]
+    ("decision", "TEXT"),
+    ("last_viewed", "REAL"),                     # このアプリで確認した日時
+    ("trashed_at", "REAL"),
+]
 CURATION_CHOICES = ("残す", "整理候補", "保留")
 TRAINABLE_CHOICES = ("残す", "整理候補")  # 「保留」は教師データに使わない
 CLASSIFY_SCOPE = "classify"  # ジャンル分類AI
@@ -110,6 +127,31 @@ CREATE TABLE IF NOT EXISTS curation_labels (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_curation_active ON curation_labels(scope, genre_id, active);
+CREATE TABLE IF NOT EXISTS scan_locations (
+    path TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,            -- known（ユーザーフォルダ） / drive（内蔵ドライブ） / extra（設定で追加）
+    label TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT '未調査',  -- 未調査 / 調査中 / 完了 / 一部スキップ / 中断
+    files INTEGER NOT NULL DEFAULT 0,
+    bytes INTEGER NOT NULL DEFAULT 0,
+    last_completed REAL
+);
+CREATE TABLE IF NOT EXISTS scan_skips (
+    path TEXT PRIMARY KEY,
+    location TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    kind TEXT NOT NULL,            -- error（アクセスできない） / excluded（除外範囲）
+    seen_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS trash_log (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    result TEXT NOT NULL,          -- moved / error
+    message TEXT,
+    at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -154,6 +196,10 @@ class Database:
 
     def _migrate(self) -> None:
         """以前の版のデータベースとの互換性を保つ。"""
+        vcols = {r[1] for r in self.conn.execute("PRAGMA table_info(videos)")}
+        for name, decl in _MEDIA_COLUMNS:
+            if name not in vcols:
+                self.conn.execute(f"ALTER TABLE videos ADD COLUMN {name} {decl}")
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(models)")}
         if "scope" not in cols:
             self.conn.execute(f"ALTER TABLE models ADD COLUMN scope TEXT NOT NULL DEFAULT '{CLASSIFY_SCOPE}'")
@@ -230,8 +276,9 @@ class Database:
         self.conn.execute(
             "UPDATE videos SET size=?, mtime=?, analysis_state='未解析', analysis_error=NULL, "
             "meta=NULL, features=NULL, thumbs=NULL, sha256=NULL, ai_state='未判定', "
-            "ai_genres=NULL, ai_candidates=NULL, ai_reason=NULL, ai_model_version=NULL "
-            "WHERE id=?", (size, mtime, video_id))
+            "ai_genres=NULL, ai_candidates=NULL, ai_reason=NULL, ai_model_version=NULL, "
+            "taken_at=NULL, dhash=NULL, similar_group=NULL, light_state='未解析', light_note=NULL, "
+            "failure=NULL WHERE id=?", (size, mtime, video_id))
         self.conn.execute("DELETE FROM video_tags WHERE video_id=? AND source='ai'", (video_id,))
 
     def update_file_state(self, video_id: int, size: int, mtime: float) -> bool:
@@ -247,11 +294,17 @@ class Database:
         return self.conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
 
     def videos(self, include_missing: bool = False) -> list[sqlite3.Row]:
-        sql = "SELECT * FROM videos" + ("" if include_missing else " WHERE missing=0")
+        """動画機能（ジャンル分類・厳選など）が扱う動画。画像は含めない。"""
+        sql = "SELECT * FROM videos WHERE kind='video'" + ("" if include_missing else " AND missing=0")
         return self.conn.execute(sql + " ORDER BY id").fetchall()
 
     def video_ids(self) -> list[int]:
-        return [r[0] for r in self.conn.execute("SELECT id FROM videos WHERE missing=0")]
+        return [r[0] for r in self.conn.execute(
+            "SELECT id FROM videos WHERE missing=0 AND kind='video'")]
+
+    def media(self) -> list[sqlite3.Row]:
+        """整理画面が扱う画像と動画（ごみ箱へ移動済み・見つからないものは除く）。"""
+        return self.conn.execute("SELECT * FROM videos WHERE missing=0 ORDER BY id").fetchall()
 
     def set_flag(self, video_id: int, column: str, value: bool) -> None:
         if column not in ("favorite", "protected"):
@@ -261,10 +314,12 @@ class Database:
 
     def update_video(self, video_id: int, **fields) -> None:
         allowed = {"analysis_state", "analysis_error", "meta", "features", "thumbs", "sha256",
-                   "ai_state", "ai_genres", "ai_candidates", "ai_reason", "ai_model_version"}
+                   "ai_state", "ai_genres", "ai_candidates", "ai_reason", "ai_model_version",
+                   "taken_at", "dhash", "similar_group", "light_state", "light_note", "failure",
+                   "last_viewed"}
         if not fields or set(fields) - allowed:
             raise ValueError(fields)
-        for key in ("meta", "features", "thumbs", "ai_genres", "ai_candidates"):
+        for key in ("meta", "features", "thumbs", "ai_genres", "ai_candidates", "failure"):
             if key in fields and fields[key] is not None and not isinstance(fields[key], str):
                 fields[key] = json.dumps(fields[key], ensure_ascii=False)
         cols = ", ".join(f"{k}=?" for k in fields)
@@ -357,6 +412,81 @@ class Database:
     def labeled_genres(self) -> set[int]:
         return {r[0] for r in self.conn.execute(
             "SELECT DISTINCT genre_id FROM curation_labels WHERE scope='genre'")}
+
+    # --- 整理画面（画像・動画）---------------------------------------------------
+    def upsert_media(self, records: list[tuple], gen: int, location: str) -> tuple[int, int]:
+        """自動スキャンで見つかった画像・動画を登録する。
+
+        records: (path, name, folder, size, mtime, ext, kind, cloud_only)
+        変更のないファイルは解析結果（ハッシュ・サムネイルなど）をそのまま使う。
+        戻り値: (新規件数, 変更により解析をやり直す件数)
+        """
+        added = changed = 0
+        now = time.time()
+        for path, name, folder, size, mtime, ext, kind, cloud in records:
+            row = self.conn.execute("SELECT id,size,mtime,trashed_at FROM videos WHERE path=?",
+                                    (path,)).fetchone()
+            if row is None:
+                self.conn.execute(
+                    "INSERT INTO videos(path,name,folder,size,mtime,ext,cloud_only,added_at,kind,location,"
+                    "seen_gen) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (path, name, folder, size, mtime, ext, int(cloud), now, kind, location, gen))
+                added += 1
+                continue
+            self.conn.execute(
+                "UPDATE videos SET missing=0, trashed_at=NULL, cloud_only=?, kind=?, location=?, seen_gen=? "
+                "WHERE id=?", (int(cloud), kind, location, gen, row["id"]))
+            if row["size"] != size or abs(row["mtime"] - mtime) > 1e-6:
+                self._invalidate(row["id"], size, mtime)
+                changed += 1
+        self.conn.commit()
+        return added, changed
+
+    def mark_unseen_missing(self, location: str, gen: int) -> int:
+        """最後まで調べられた場所で見つからなかったファイルを非表示にする（記録は残す）。"""
+        cur = self.conn.execute(
+            "UPDATE videos SET missing=1 WHERE location=? AND seen_gen<? AND missing=0", (location, gen))
+        self.conn.commit()
+        return cur.rowcount
+
+    def set_decision(self, media_id: int, decision: str | None) -> None:
+        if decision is not None and decision not in DECISIONS:
+            raise ValueError(decision)
+        if decision == "削除候補" and self.video(media_id)["protected"]:
+            raise PermissionError("「絶対に残す」を付けたファイルは削除候補にできません")
+        self.conn.execute("UPDATE videos SET decision=? WHERE id=?", (decision, media_id))
+        self.conn.commit()
+
+    def set_protected(self, media_id: int, value: bool) -> None:
+        """「絶対に残す」。付けると削除候補から外す。"""
+        if value:
+            self.conn.execute("UPDATE videos SET protected=1, decision=CASE WHEN decision='削除候補' "
+                              "THEN NULL ELSE decision END WHERE id=?", (media_id,))
+        else:
+            self.conn.execute("UPDATE videos SET protected=0 WHERE id=?", (media_id,))
+        self.conn.commit()
+
+    def mark_viewed(self, media_id: int) -> None:
+        if self.get_setting("view_history_started") is None:
+            self.set_setting("view_history_started", str(time.time()))
+        self.conn.execute("UPDATE videos SET last_viewed=? WHERE id=?", (time.time(), media_id))
+        self.conn.commit()
+
+    def mark_trashed(self, media_id: int) -> None:
+        self.conn.execute("UPDATE videos SET trashed_at=?, missing=1, decision=NULL WHERE id=?",
+                          (time.time(), media_id))
+        self.conn.commit()
+
+    def log_trash(self, path: str, size: int, result: str, message: str | None) -> None:
+        self.conn.execute("INSERT INTO trash_log(path,size,result,message,at) VALUES (?,?,?,?,?)",
+                          (path, size, result, message, time.time()))
+        self.conn.commit()
+
+    def json_list(self, key: str) -> list[str]:
+        return loads(self.get_setting(key), []) or []
+
+    def set_json_list(self, key: str, values: list[str]) -> None:
+        self.set_setting(key, json.dumps(values, ensure_ascii=False))
 
     # --- ジャンル ---------------------------------------------------------
     def genres(self) -> list[sqlite3.Row]:
@@ -542,20 +672,21 @@ class Database:
     def stats(self) -> dict:
         q = lambda sql: self.conn.execute(sql).fetchone()[0]  # noqa: E731
         return {
-            "videos": q("SELECT COUNT(*) FROM videos WHERE missing=0"),
-            "total_size": q("SELECT COALESCE(SUM(size),0) FROM videos WHERE missing=0"),
-            "analyzed": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND analysis_state IN ('完了','一部失敗')"),
-            "failed": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND analysis_state='失敗'"),
+            "videos": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND kind='video'"),
+            "total_size": q("SELECT COALESCE(SUM(size),0) FROM videos WHERE missing=0 AND kind='video'"),
+            "analyzed": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND kind='video' "
+                          "AND analysis_state IN ('完了','一部失敗')"),
+            "failed": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND kind='video' AND analysis_state='失敗'"),
             "manual": q("SELECT COUNT(DISTINCT video_id) FROM video_genres"),
             "ai_classified": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND ai_state='分類済み'"),
             "unclassified": q("SELECT COUNT(*) FROM videos v WHERE missing=0 AND ai_state='未分類' "
                               "AND NOT EXISTS (SELECT 1 FROM video_genres g WHERE g.video_id=v.id)"),
-            "favorite": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND favorite=1"),
-            "protected": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND protected=1"),
+            "favorite": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND kind='video' AND favorite=1"),
+            "protected": q("SELECT COUNT(*) FROM videos WHERE missing=0 AND kind='video' AND protected=1"),
             "training": q("SELECT COUNT(*) FROM training"),
             "pending": self.pending_training_count(),
             "review": q("SELECT COUNT(*) FROM curation_labels WHERE active=1 AND needs_review=1"),
-            "missing": q("SELECT COUNT(*) FROM videos WHERE missing=1"),
+            "missing": q("SELECT COUNT(*) FROM videos WHERE missing=1 AND kind='video' AND trashed_at IS NULL"),
         }
 
 
