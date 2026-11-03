@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMenu, QMessageBox,
     QProgressBar, QPushButton, QScrollArea, QSplitter, QStackedWidget, QStyle, QStyledItemDelegate, QTabBar,
-    QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
+    QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from . import autoscan, candidates, media, theme, trash
@@ -772,7 +773,7 @@ class DetailPanel(QFrame):
         self.compare_scroll = compare_scroll
         self.stack.addWidget(compare_scroll)
 
-    def show_single(self, media_id: int) -> None:
+    def show_single(self, media_id: int, plan_reasons: list[str] | None = None) -> None:
         db = self.browser.state.db
         r = db.video(media_id)
         if r is None:
@@ -807,7 +808,7 @@ class DetailPanel(QFrame):
         started = db.get_setting("view_history_started")
         add("最終確認", candidates.format_date(r["last_viewed"])
             + (f"（{candidates.format_date(float(started))} より前の記録はありません）" if started else ""))
-        reasons = ctx.reasons(r)
+        reasons = list(plan_reasons) if plan_reasons else ctx.reasons(r)
         notes = []
         if r["cloud_only"]:
             notes.append("オンライン専用ファイルです。自動ダウンロードしないため、内容の解析・プレビュー・ごみ箱への移動は行いません。")
@@ -917,7 +918,7 @@ class MediaBrowser(QWidget):
         head = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
-        self.title = label("ファイル一覧" if mode == "files" else "整理のおすすめ", "title")
+        self.title = label("ファイル一覧" if mode == "files" else "その他の整理（画像など）", "title")
         self.help = label("", "sub", wrap=True)
         title_box.addWidget(self.title)
         title_box.addWidget(self.help)
@@ -1289,9 +1290,12 @@ class StatCard(QFrame):
 
 
 class HomePage(QWidget):
-    start_organizing = Signal(str)
+    """空き容量・調査済み録画の合計・目標容量の入力を中心にしたホーム。"""
+
+    start_plan = Signal(float)
     request_locations = Signal()
     request_files = Signal()
+    request_settings = Signal()
 
     def __init__(self, state: MediaState, parent=None) -> None:
         super().__init__(parent)
@@ -1310,45 +1314,58 @@ class HomePage(QWidget):
         v.addWidget(label("ホーム", "title"))
         self.lead = label("", "sub", wrap=True)
         v.addWidget(self.lead)
-        actions = QHBoxLayout()
-        self.primary = button("", "primary", "sparkle")
-        self.primary.setMinimumHeight(36)
-        self.secondary = button("ファイル一覧を見る", None, "files")
-        actions.addWidget(self.primary)
-        actions.addWidget(self.secondary)
-        actions.addStretch()
-        v.addLayout(actions)
+        self.banner = FFmpegBanner(state.tools_fn)
+        self.banner.open_settings.connect(self.request_settings.emit)
+        v.addWidget(self.banner)
         grid = QGridLayout()
         grid.setSpacing(theme.S2)
-        self.total = StatCard("調査済みのファイル", "search")
-        self.images = StatCard("画像", "image")
-        self.videos = StatCard("動画", "film")
-        self.saving = StatCard("整理による解放見込み", "target")
-        self.drive = StatCard("ドライブ全体の使用量（参考）", "drive")
-        self.rec = card_frame()
-        rv = QVBoxLayout(self.rec)
-        rv.setContentsMargins(theme.S2, theme.S2, theme.S2, theme.S2)
-        head = QHBoxLayout()
+        self.free = StatCard("空き容量（実際）", "drive")
+        self.total = StatCard("調査済みの録画", "film")
+        # 目標容量の入力
+        self.goal = card_frame()
+        gv = QVBoxLayout(self.goal)
+        gv.setContentsMargins(theme.S2, theme.S2, theme.S2, theme.S2)
+        gh = QHBoxLayout()
         ic = QLabel()
-        ic.setPixmap(theme.pixmap("sparkle", theme.ACCENT, 18))
-        head.addWidget(ic)
-        head.addWidget(label("どこから整理するとよいか", "sub"), 1)
-        rv.addLayout(head)
-        self.rec_rows = QVBoxLayout()
-        self.rec_rows.setSpacing(4)
-        rv.addLayout(self.rec_rows)
-        rv.addStretch()
-        grid.addWidget(self.total, 0, 0)
-        grid.addWidget(self.images, 0, 1)
-        grid.addWidget(self.videos, 0, 2)
-        grid.addWidget(self.rec, 1, 0, 1, 2)
-        grid.addWidget(self.saving, 1, 2)
-        grid.addWidget(self.drive, 2, 0)
+        ic.setPixmap(theme.pixmap("target", theme.ACCENT, 18))
+        gh.addWidget(ic)
+        gh.addWidget(label("どれくらい空けたいですか", "sub"), 1)
+        gv.addLayout(gh)
+        row = QHBoxLayout()
+        self.target = QDoubleSpinBox()
+        self.target.setRange(0.1, 100000)
+        self.target.setDecimals(1)
+        self.target.setValue(10)
+        self.target.setSuffix(" GB")
+        self.target.setMinimumWidth(110)
+        self.primary = button("", "primary", "sparkle")
+        self.primary.setMinimumHeight(34)
+        row.addWidget(self.target)
+        row.addWidget(self.primary, 1)
+        gv.addLayout(row)
+        self.goal_note = label("", "caption", wrap=True)
+        gv.addWidget(self.goal_note)
+        gv.addStretch()
+        self.saving = StatCard("完全一致の重複（同じ録画が残ります）", "copy")
+        self.images = StatCard("画像（補助機能）", "image")
+        grid.addWidget(self.free, 0, 0)
+        grid.addWidget(self.total, 0, 1)
+        grid.addWidget(self.goal, 0, 2)
+        grid.addWidget(self.saving, 1, 0)
+        grid.addWidget(self.images, 1, 1)
         for c in range(3):
             grid.setColumnStretch(c, 1)
         v.addLayout(grid)
+        links = QHBoxLayout()
+        self.locations_button = button("調べる場所を選ぶ…", None, "folder")
+        self.secondary = button("ファイル一覧を見る", None, "files")
+        links.addWidget(self.locations_button)
+        links.addWidget(self.secondary)
+        links.addStretch()
+        v.addLayout(links)
         v.addStretch()
         self.primary.clicked.connect(self._primary)
+        self.locations_button.clicked.connect(self.request_locations.emit)
         self.secondary.clicked.connect(self.request_files.emit)
         state.changed.connect(self.refresh)
         state.scan_progress.connect(lambda _: self.refresh_status())
@@ -1356,90 +1373,62 @@ class HomePage(QWidget):
 
     def _primary(self) -> None:
         if self.state.has_data():
-            self.start_organizing.emit(self._first_category or "重複")
+            self.start_plan.emit(self.target.value())
         else:
             self.request_locations.emit()
 
     def refresh_status(self) -> None:
+        self.banner.update_state()
         st = self.state.scan_state()
         has = self.state.has_data()
         scanning = st["kind"] in ("調査中", "一時停止中")
-        self.primary.setText("整理をはじめる" if has else ("調査中…" if scanning else "調べる場所を選ぶ"))
+        self.primary.setText("整理候補を見る" if has else ("調査中…" if scanning else "調べる場所を選ぶ"))
         self.primary.setIcon(theme.icon("sparkle" if has else "folder", "#FFFFFF", 16))
         self.primary.setEnabled(has or not scanning)
-        if scanning and not has:
-            for card in (self.total, self.images, self.videos):
-                card.value.setText("調査中")
-            self.saving.set("算出中", "調査が終わると算出します。")
-        if not has:
-            self.lead.setText("まだ調査結果がありません。調べる場所を選ぶと、画像と動画を探して整理候補を表示します。"
-                              if st["kind"] not in ("調査中", "一時停止中") else "調査中です。見つかったものから順に表示します。")
+        self.goal_note.setText("重複を最優先に、目標に合わせた整理候補を理由付きで提案します。"
+                               if has else "まず録画が保存されているフォルダを調査してください。")
+        if has:
+            self.lead.setText("空き容量と録画の合計を確認し、空けたい容量を入力して整理候補を見てみましょう。")
+        elif scanning:
+            self.lead.setText("調査中です。見つかった録画から順に集計します。")
+            self.total.set("調査中")
+            self.saving.set("算出中")
         else:
-            self.lead.setText("何が容量を使っているかを確認し、「整理をはじめる」からおすすめの候補を見ていきましょう。")
+            self.lead.setText("録画で容量がいっぱいのときに、どれを整理すればよいかを理由付きで提案します。"
+                              "まず調べる場所を選んでください。")
 
     def refresh(self) -> None:
         ctx = self.state.ctx
-        rows = list(ctx.rows.values())
+        videos = [r for r in ctx.rows.values() if r["kind"] == "video"]
+        images = [r for r in ctx.rows.values() if r["kind"] == "image"]
         scanning = self.state.runner.is_running()
-        if not rows:
-            self.total.set("未調査", "このアプリが見つけた画像・動画の合計を表示します（ドライブ全体の使用量ではありません）。")
-            self.images.set("未調査")
-            self.videos.set("未調査")
+        paths = [r[0] for r in self.state.db.conn.execute("SELECT path FROM scan_locations")]
+        spaces = candidates.drive_space(paths or [system_drive_usage()[0] if system_drive_usage() else "/"])
+        if spaces:
+            d = spaces[0]
+            more = "".join(f"／{x['root']} 残り {format_size(x['free'])}" for x in spaces[1:])
+            self.free.set(format_size(d["free"]), f"{d['root']} の空き（全体 {format_size(d['total'])}）{more}。"
+                                                   "ドライブの実際の値です。")
+        else:
+            self.free.set("取得できません")
+        if not ctx.rows:
+            self.total.set("未調査", "調査すると、録画の本数と合計サイズを表示します。")
             self.saving.set("算出できません", "調査結果がないため算出できません。")
+            self.images.set("未調査")
         else:
-            total = sum(r["size"] for r in rows)
-            self.total.set(format_size(total), f"{len(rows):,} 件。このアプリが見つけた画像・動画の合計です"
-                                               "（ドライブ全体の使用量ではありません）。"
-                           + ("調査中のため増える可能性があります。" if scanning else ""))
-            for card, kind in ((self.images, "image"), (self.videos, "video")):
-                ks = [r for r in rows if r["kind"] == kind]
-                card.set(format_size(sum(r["size"] for r in ks)), f"{len(ks):,} 件")
+            self.total.set(format_size(sum(r["size"] for r in videos)),
+                           f"{len(videos):,} 本（ファイルサイズの合計。ドライブ全体の使用量とは別です）"
+                           + ("。調査中のため増える可能性があります" if scanning else ""))
+            groups = [ids for ids in ctx.dup_groups.values() if ctx.rows[ids[0]]["kind"] == "video"]
             extra = sum(ctx.rows[i]["size"] for h, ids in ctx.dup_groups.items()
-                        for i in ids if i != ctx.dup_keep[h][0])
+                        if ctx.rows[ids[0]]["kind"] == "video" for i in ids if i != ctx.dup_keep[h][0])
             if scanning:
-                self.saving.set("算出中", "調査が終わると、完全重複の重複分を表示します。")
-            elif ctx.dup_groups:
-                self.saving.set(format_size(extra), "完全重複を1つずつ残した場合の重複分です。ごみ箱を空にした後に空きます。"
-                                "類似画像などは、どれを残すかで変わるため含めていません。")
+                self.saving.set("算出中", "調査が終わると、重複分を表示します。")
             else:
-                self.saving.set("0 B", "完全重複は見つかりませんでした。類似画像などは、どれを残すかで変わるため算出していません。")
-        du = system_drive_usage()
-        if du:
-            root, used, total = du
-            self.drive.set(f"{format_size(used)} / {format_size(total)}",
-                           f"{root} の使用量です。上の「調査済みのファイル」とは別の値です。")
-        else:
-            self.drive.set("取得できません")
-        # どこから整理するとよいか
-        while self.rec_rows.count():
-            item = self.rec_rows.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._first_category = None
-        entries = [("重複", "完全重複", f"{len(ctx.dup_groups):,} グループ", sum(
-                       ctx.rows[i]["size"] for h, ids in ctx.dup_groups.items() for i in ids if i != ctx.dup_keep[h][0])),
-                   ("類似画像", "類似画像", f"{len(ctx.sim_groups):,} グループ", None),
-                   ("録画確認候補", "録画確認候補", f"{len(candidates.category_ids(ctx, '録画確認候補')):,} 件", None),
-                   ("大容量", "大容量（100MB以上）", f"{len(candidates.category_ids(ctx, '大容量')):,} 件",
-                    sum(ctx.rows[i]["size"] for i in candidates.category_ids(ctx, "大容量")))]
-        if not rows:
-            self.rec_rows.addWidget(label("調査すると、ここに整理のおすすめが表示されます。", "sub", wrap=True))
-        for key, title, count, size in entries:
-            if not rows:
-                break
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.addWidget(label(title), 1)
-            h.addWidget(label(count + (f" · {format_size(size)}" if size else ""), "sub"))
-            link = button("確認する", "link")
-            link.clicked.connect(partial(self.start_organizing.emit, key))
-            empty = count.startswith("0 ")
-            link.setEnabled(not empty)
-            if not empty and self._first_category is None:
-                self._first_category = key
-            h.addWidget(link)
-            self.rec_rows.addWidget(row)
+                self.saving.set(format_size(extra), f"{len(groups):,} グループ。各グループで1本を残した場合の重複分です"
+                                                    "（ごみ箱を空にした後に空きます）。")
+            self.images.set(f"{len(images):,} 件", f"{format_size(sum(r['size'] for r in images))}。"
+                                                   "画像の整理は「その他の整理」で行えます。")
         self.refresh_status()
 
 
@@ -1573,6 +1562,346 @@ class LocationsDialog(QDialog):
                     if self.list.item(i).checkState() != Qt.CheckState.Checked]
         self.db.set_json_list("disabled_locations", disabled)
         self.accept()
+
+
+# =============================================================================
+# 整理候補（目標容量に合わせたルールによる提案）
+# =============================================================================
+class FFmpegBanner(QFrame):
+    """FFmpeg が見つからないときの案内。"""
+
+    open_settings = Signal()
+
+    def __init__(self, tools_fn) -> None:
+        super().__init__()
+        self.setObjectName("SelectionBar")
+        self.tools_fn = tools_fn
+        h = QHBoxLayout(self)
+        h.setContentsMargins(theme.S1, 4, theme.S1, 4)
+        ic = QLabel()
+        ic.setPixmap(theme.pixmap("warning", theme.WARN, 16))
+        h.addWidget(ic)
+        h.addWidget(label("FFmpeg が見つかりません。録画の長さ・プレビュー画像・失敗した録画の判定ができません"
+                          "（重複の検出と容量の集計はできます）。", None, wrap=True), 1)
+        b = button("設定を開く", None, "settings")
+        b.clicked.connect(self.open_settings.emit)
+        h.addWidget(b)
+        self.update_state()
+
+    def update_state(self) -> None:
+        self.setVisible(not self.tools_fn().available)
+
+
+class PlanPage(QWidget):
+    """ホーム → 整理候補 → 内容確認 → 最終確認 の中心画面。"""
+
+    request_locations = Signal()
+    request_settings = Signal()
+
+    def __init__(self, state: MediaState, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("Page")
+        self.state = state
+        self.plan: dict | None = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(theme.S3, theme.S2, theme.S3, theme.S1)
+        v.setSpacing(theme.S1)
+        v.addWidget(label("整理候補", "title"))
+        self.help = label("空けたい容量を入力すると、決まったルールで録画の整理候補を提案します（AI による判定ではありません）。"
+                          "完全一致の重複を最優先にし、足りない場合だけ「要確認」の候補を追加します。", "sub", wrap=True)
+        v.addWidget(self.help)
+        self.banner = FFmpegBanner(state.tools_fn)
+        self.banner.open_settings.connect(self.request_settings.emit)
+        v.addWidget(self.banner)
+        row = QHBoxLayout()
+        row.addWidget(label("空けたい容量"))
+        self.target = QDoubleSpinBox()
+        self.target.setRange(0.1, 100000)
+        self.target.setDecimals(1)
+        self.target.setValue(10)
+        self.target.setSuffix(" GB")
+        self.target.setMinimumWidth(120)
+        self.propose_button = button("提案する", "primary", "target")
+        row.addWidget(self.target)
+        row.addWidget(self.propose_button)
+        row.addStretch()
+        v.addLayout(row)
+        cards = QHBoxLayout()
+        cards.setSpacing(theme.S1)
+        self.status_card = StatCard("目標への達成状況", "target")
+        self.total_card = StatCard("提案の合計（ファイルサイズ）", "flag")
+        self.free_card = StatCard("空き容量（実際）", "drive")
+        for c in (self.status_card, self.total_card, self.free_card):
+            cards.addWidget(c, 1)
+        v.addLayout(cards)
+        self.note = label("解放見込みはファイルサイズの合計です。ごみ箱へ移しただけでは空き容量は増えず、"
+                          "ごみ箱を空にすると増えます。", "caption", wrap=True)
+        v.addWidget(self.note)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["録画", "容量", "理由", "保存場所"])
+        self.tree.setColumnWidth(0, 260)
+        self.tree.setColumnWidth(1, 90)
+        self.tree.setColumnWidth(2, 380)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setTextElideMode(Qt.TextElideMode.ElideRight)  # 理由の全文は詳細とツールチップで確認できる
+        self.empty = EmptyState()
+        self.content = QStackedWidget()
+        self.content.addWidget(self.tree)
+        self.content.addWidget(self.empty)
+        self.detail = DetailPanel(self)
+        self.detail.setMinimumWidth(300)
+        self.detail.hide()
+        self.splitter = QSplitter()
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.addWidget(self.content)
+        self.splitter.addWidget(self.detail)
+        v.addWidget(self.splitter, 1)
+        bar = QHBoxLayout()
+        self.selected_label = label("", "subtitle")
+        self.protect_button = button("保護する", None, "shield", "残す録画を保護します。以後の提案・ごみ箱への移動から除外します")
+        self.keep_button = button("残す（候補から外す）", None, "check", "この録画を整理しないと記録し、提案から外します")
+        self.compare_button = button("重複を比較", None, "copy", "同じ内容のファイルを並べて確認します")
+        self.final_button = button("最終確認へ…", "danger", "trash",
+                                   "チェックした録画を確認してから Windows のごみ箱へ移します（完全削除はしません）")
+        bar.addWidget(self.selected_label, 1)
+        for b in (self.compare_button, self.keep_button, self.protect_button, self.final_button):
+            bar.addWidget(b)
+        v.addLayout(bar)
+
+        self.propose_button.clicked.connect(self.propose)
+        self.target.editingFinished.connect(self.propose)
+        self.tree.itemChanged.connect(self._on_check)
+        self.tree.currentItemChanged.connect(self._on_current)
+        self.detail.closed.connect(self._close_detail)
+        self.protect_button.clicked.connect(lambda: self._decide_current("保護する"))
+        self.keep_button.clicked.connect(lambda: self._decide_current("残す"))
+        self.compare_button.clicked.connect(self._compare_current)
+        self.final_button.clicked.connect(self.final_confirm)
+        state.changed.connect(self.replan)
+        self.replan()
+
+    # DetailPanel・ComparePanel から使う
+    @property
+    def ctx(self):
+        return self.state.ctx
+
+    @property
+    def loader(self):
+        return self.state.loader
+
+    @property
+    def db(self):
+        return self.state.db
+
+    def apply_decision(self, name: str, ids: list[int] | None = None) -> None:
+        ids = ids if ids is not None else ([self._current_id()] if self._current_id() else [])
+        self.state.decide(name, ids)
+
+    def open_location(self) -> None:
+        mid = self._current_id()
+        if mid and os.name == "nt":
+            subprocess.Popen(["explorer", "/select,", self.state.db.video(mid)["path"]])
+
+    def selected_ids(self) -> list[int]:
+        mid = self._current_id()
+        return [mid] if mid else []
+
+    # --- 提案 ---------------------------------------------------------------
+    def set_target_gb(self, gb: float) -> None:
+        self.target.setValue(gb)
+        self.propose()
+
+    def propose(self) -> None:
+        self._proposed_target = self.target.value()
+        self.replan()
+
+    def replan(self) -> None:
+        self.banner.update_state()
+        ctx = self.state.ctx
+        target = int(self.target.value() * 1024 ** 3)
+        checked_before = {it["id"]: it for it in (self.plan or {}).get("items", [])}
+        prev_checks = getattr(self, "_checks", {})
+        self.plan = candidates.plan_recordings(ctx, target)
+        self._checks = {}
+        for it in self.plan["items"]:
+            row = ctx.rows[it["id"]]
+            if it["id"] in prev_checks and it["id"] in checked_before:
+                self._checks[it["id"]] = prev_checks[it["id"]]
+            else:  # 重複は提案どおり、要確認は内容を見てから選ぶ。保存済みの「削除候補」は選択済み
+                self._checks[it["id"]] = it["kind"] == "duplicate" or row["decision"] == "削除候補"
+        self._fill_tree()
+        self._update_summary()
+
+    def _fill_tree(self) -> None:
+        ctx = self.state.ctx
+        current = self._current_id()
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        groups = {}
+        for kind, title in (("duplicate", "重複（同じ録画が残ります）"), ("review", "要確認（内容を確認してから選んでください）")):
+            items = [it for it in self.plan["items"] if it["kind"] == kind]
+            if not items:
+                continue
+            top = QTreeWidgetItem([f"{title}　{len(items)} 本・{format_size(sum(i['size'] for i in items))}"])
+            f = top.font(0)
+            f.setBold(True)
+            top.setFont(0, f)
+            top.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.tree.addTopLevelItem(top)
+            top.setFirstColumnSpanned(True)  # ツリーに追加してから列を結合する
+            groups[kind] = top
+            for it in items:
+                r = ctx.rows[it["id"]]
+                child = QTreeWidgetItem([r["name"], format_size(it["size"]), " ／ ".join(it["reasons"]), r["folder"]])
+                child.setData(0, Qt.ItemDataRole.UserRole, it["id"])
+                child.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.CheckState.Checked if self._checks.get(it["id"]) else Qt.CheckState.Unchecked)
+                child.setToolTip(0, r["path"])
+                child.setToolTip(2, "\n".join(it["reasons"]))
+                child.setIcon(0, theme.icon("film" if r["kind"] == "video" else "image", theme.TEXT_SUB, 16))
+                top.addChild(child)
+                if it["id"] == current:
+                    self.tree.setCurrentItem(child)
+            top.setExpanded(True)
+        self.tree.blockSignals(False)
+        self._show_content()
+
+    def _show_content(self) -> None:
+        if self.plan["items"]:
+            self.content.setCurrentWidget(self.tree)
+            return
+        self.content.setCurrentWidget(self.empty)
+        self.detail.hide()
+        st = self.state.scan_state()
+        if not self.state.has_data():
+            if st["kind"] in ("調査中", "一時停止中"):
+                self.empty.show_state("search", "調査中です", "録画が見つかると、整理候補を提案できるようになります。")
+            else:
+                self.empty.show_state("folder", "まだ調査していません", "録画が保存されているフォルダを選んで調査してください。",
+                                      "調べる場所を選ぶ", self.request_locations.emit)
+            return
+        self.empty.show_state("check", "整理候補はありません",
+                              "完全一致の重複も、「要確認」に当てはまる録画（失敗した可能性・500MB以上・1年以上更新なし）も"
+                              "見つかりませんでした。保護・「残す」にした録画は対象外です。")
+
+    def _update_summary(self) -> None:
+        p = self.plan
+        has = self.state.has_data()
+        if not has:
+            self.status_card.set("未調査", "調査すると提案できます。")
+            self.total_card.set("-", "")
+        else:
+            if p["achieved"]:
+                self.status_card.set("達成できます", f"提案どおりに整理すると、目標 {format_size(p['target'])} に届きます。")
+            else:
+                note = "条件に合う候補が足りないため、ほかの録画は追加していません。"
+                self.status_card.set(f"不足 {format_size(p['shortage'])}", f"目標 {format_size(p['target'])} に対して不足します。{note}")
+            ex = "・".join(f"{k} {v} 件" for k, v in p["excluded"].items() if v)
+            self.total_card.set(format_size(p["total"]),
+                                f"重複 {format_size(p['duplicate_total'])}・要確認 {format_size(p['review_total'])}"
+                                + (f"。対象外: {ex}" if ex else ""))
+        paths = [r[0] for r in self.state.db.conn.execute("SELECT path FROM scan_locations")] or [
+            os.environ.get("SystemDrive", "C:") + "\\" if os.name == "nt" else "/"]
+        spaces = candidates.drive_space(paths)
+        if spaces:
+            first = spaces[0]
+            more = "".join(f"\n{d['root']}: 残り {format_size(d['free'])} / {format_size(d['total'])}" for d in spaces[1:])
+            self.free_card.set(format_size(first["free"]),
+                               f"{first['root']} の空き（全体 {format_size(first['total'])}）。"
+                               f"提案の合計とは別の、今の実際の値です。{more}")
+        else:
+            self.free_card.set("取得できません")
+        self._update_selected()
+
+    def checked_ids(self) -> list[int]:
+        return [mid for mid, on in self._checks.items() if on]
+
+    def _update_selected(self) -> None:
+        ids = self.checked_ids()
+        ctx = self.state.ctx
+        total = sum(ctx.rows[i]["size"] for i in ids if i in ctx.rows)
+        target = self.plan["target"] if self.plan else 0
+        rest = max(target - total, 0)
+        self.selected_label.setText(f"選択中 {len(ids):,} 本・{format_size(total)}"
+                                    + (f"（目標まであと {format_size(rest)}）" if rest else "（目標に届きます）"))
+        self.final_button.setEnabled(bool(ids))
+        mid = self._current_id()
+        self.protect_button.setEnabled(bool(mid))
+        self.keep_button.setEnabled(bool(mid))
+        self.compare_button.setVisible(bool(mid) and mid in ctx.dup_of)
+
+    def _on_check(self, item, column) -> None:
+        mid = item.data(0, Qt.ItemDataRole.UserRole)
+        if mid is not None:
+            self._checks[mid] = item.checkState(0) == Qt.CheckState.Checked
+            self._update_selected()
+
+    def _current_id(self) -> int | None:
+        item = self.tree.currentItem()
+        return item.data(0, Qt.ItemDataRole.UserRole) if item else None
+
+    def _plan_item(self, mid: int) -> dict | None:
+        return next((it for it in (self.plan or {}).get("items", []) if it["id"] == mid), None)
+
+    def _on_current(self, *_) -> None:
+        mid = self._current_id()
+        self._update_selected()
+        if mid is None:
+            return
+        if not self.detail.isVisible():
+            self.detail.show()
+            total = self.splitter.width()
+            panel = max(320, min(460, int(total * (0.5 if total < 1000 else 0.38))))
+            self.splitter.setSizes([total - panel, panel])
+        it = self._plan_item(mid)
+        self.detail.show_single(mid, it["reasons"] if it else None)
+
+    def _close_detail(self) -> None:
+        self.detail.player.stop()
+        self.detail.hide()
+        self.tree.setCurrentItem(None)
+
+    def _decide_current(self, name: str) -> None:
+        mid = self._current_id()
+        if mid:
+            self._checks.pop(mid, None)
+            self.state.decide(name, [mid])
+
+    def _compare_current(self) -> None:
+        mid = self._current_id()
+        h = self.state.ctx.dup_of.get(mid)
+        if h:
+            self.detail.show()
+            self.detail.show_group("重複", h)
+
+    def resizeEvent(self, event) -> None:
+        """画面が低いときは補足を隠して一覧に場所を譲る（補足はツールチップで確認できる）。"""
+        super().resizeEvent(event)
+        compact = self.height() < 620
+        self.help.setVisible(not compact)
+        self.note.setVisible(not compact)
+        for card in (self.status_card, self.total_card, self.free_card):
+            card.detail.setVisible(not compact)
+            card.setToolTip(card.detail.text() if compact else "")
+        self.selected_label.setWordWrap(compact)
+
+    def final_confirm(self) -> None:
+        ids = self.checked_ids()
+        if not ids:
+            return
+        for mid in ids:  # 選択を「削除候補」として保存（起動し直しても残る）
+            try:
+                self.state.db.set_decision(mid, "削除候補")
+            except PermissionError:
+                pass
+        self.detail.player.stop()
+        dlg = TrashDialog(self.state.db, ids, self)
+        dlg.exec()
+        self.state.refresh()
+
+    def stop_media(self) -> None:
+        self.detail.player.stop()
 
 
 # =============================================================================

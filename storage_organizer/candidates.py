@@ -280,6 +280,21 @@ def failures(row) -> list[dict]:
     return loads(row["failure"], []) or []
 
 
+def file_identity(path: str) -> tuple:
+    """実体としてのファイルの識別子。
+
+    別の表記（C:\\… と C:/…、大文字小文字の違い）やハードリンクでも、同じ実体なら同じ値になる。
+    識別番号が取れない場合は、正規化した実際のパスで代用する。
+    """
+    try:
+        st = os.stat(path)
+        if st.st_ino:
+            return ("id", st.st_dev, st.st_ino)
+    except OSError:
+        pass
+    return ("path", os.path.normcase(os.path.realpath(path)))
+
+
 class Context:
     """一覧表示のたびに使う集計（重複・類似グループと残すおすすめ）。"""
 
@@ -292,7 +307,26 @@ class Context:
                 dup[r["sha256"]].append(r["id"])
             if r["similar_group"]:
                 sim[r["similar_group"]].append(r["id"])
-        self.dup_groups = {h: ids for h, ids in dup.items() if len(ids) > 1}
+        # 同じ実体を指す登録（別の表記・ハードリンク）は重複として扱わない。消しても容量は空かず、
+        # 片方を「重複分」として移動すると、実際には1本しかない録画を失うため
+        self.aliases: dict[int, int] = {}
+        groups = {}
+        for h, ids in dup.items():
+            if len(ids) < 2:
+                continue
+            seen: dict[tuple, int] = {}
+            members = []
+            for i in sorted(ids, key=lambda i: (self.rows[i]["path"] != os.path.normpath(self.rows[i]["path"]),
+                                                self.rows[i]["path"])):
+                ident = file_identity(self.rows[i]["path"])
+                if ident in seen:
+                    self.aliases[i] = seen[ident]
+                    continue
+                seen[ident] = i
+                members.append(i)
+            if len(members) > 1:
+                groups[h] = members
+        self.dup_groups = groups
         self.sim_groups = {g: ids for g, ids in sim.items() if len(ids) > 1}
         self.dup_of = {i: h for h, ids in self.dup_groups.items() for i in ids}
         self.sim_of = {i: g for g, ids in self.sim_groups.items() for i in ids}
@@ -305,6 +339,9 @@ class Context:
     def reasons(self, row) -> list[str]:
         """そのファイルが候補になった理由（大切さは判断していないことを前提に表示）。"""
         out = []
+        if row["id"] in self.aliases:
+            other = self.rows[self.aliases[row["id"]]]
+            out.append(f"同じファイルが別の表記で二重に登録されています（{other['path']}）。重複ではないため候補にしません")
         h = self.dup_of.get(row["id"])
         if h:
             keep_id, why = self.dup_keep[h]
@@ -339,7 +376,7 @@ class Context:
 
     def is_suggestable(self, row) -> bool:
         """目標容量の提案に含めてよい候補（大容量だけの理由では含めない）。"""
-        if row["protected"] or row["decision"] == "残す" or row["cloud_only"]:
+        if row["protected"] or row["decision"] == "残す" or row["cloud_only"] or row["id"] in self.aliases:
             return False
         h = self.dup_of.get(row["id"])
         if h and self.dup_keep[h][0] != row["id"]:
@@ -456,3 +493,151 @@ def format_date(ts: float | None) -> str:
     except (OverflowError, OSError, ValueError):
         return "不明"
 
+
+
+# =============================================================================
+# 録画の整理候補（目標容量に合わせたルールによる提案）
+#   1. 完全一致の重複（各グループで必ず1本を残す）を最優先にする
+#   2. 重複だけで目標に届かない場合だけ、根拠のある「要確認」候補を追加する
+#      （失敗した可能性・大容量・長期間更新なし）。古い・大きいだけで不要とは判断しない
+#   3. 保護・「残す」・オンライン専用は対象外。根拠のないファイルは追加しない
+#   視聴履歴や重要度は推測しない。機械学習は使わない。
+# =============================================================================
+REVIEW_LARGE_BYTES = 500 * 1024 * 1024  # 「容量が大きい」とする目安
+REVIEW_OLD_DAYS = 365                   # 「長期間更新されていない」とする目安
+REVIEW_OLD_MIN_BYTES = 50 * 1024 * 1024  # 古いだけの小さなファイルは候補にしない
+
+
+def drive_of(path: str) -> str:
+    """ファイルがあるドライブ（Windows はドライブ文字、それ以外はマウント位置）。"""
+    if os.name == "nt":
+        d = os.path.splitdrive(os.path.abspath(path))[0]
+        return (d + "\\") if d else path
+    p = os.path.abspath(path)
+    while not os.path.ismount(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return p
+
+
+def drive_space(paths) -> list[dict]:
+    """調査した場所があるドライブごとの実際の空き容量。"""
+    import shutil
+    result, seen = [], set()
+    for path in paths:
+        root = drive_of(path)
+        if root in seen:
+            continue
+        seen.add(root)
+        try:
+            u = shutil.disk_usage(root)
+        except OSError:
+            continue
+        result.append({"root": root, "free": u.free, "total": u.total, "used": u.used})
+    return result
+
+
+def _review_reasons(row, now_ts: float) -> list[str]:
+    reasons = []
+    for f in failures(row):
+        prefix = {"corrupt": "破損を確認: ", "read_error": "読み込みエラー: "}.get(f["kind"], "")
+        reasons.append(prefix + f["reason"])
+    if row["size"] >= REVIEW_LARGE_BYTES:
+        text = f"容量が大きい録画です（{_fmt(row['size'])}）"
+        pm = per_minute(row)
+        if pm:
+            text += f"。1分あたり {_fmt(int(pm))}"
+        reasons.append(text + "。内容を確認してください")
+    days = (now_ts - row["mtime"]) / 86400
+    if days >= REVIEW_OLD_DAYS and row["size"] >= REVIEW_OLD_MIN_BYTES:
+        reasons.append(f"約 {int(days // 30)} か月更新されていません（視聴したかどうかは分かりません）")
+    return reasons
+
+
+def _fmt(n: int) -> str:
+    from .formatting import format_size
+    return format_size(n)
+
+
+def plan_recordings(ctx: Context, target_bytes: int, include_images: bool = False,
+                    now_ts: float | None = None) -> dict:
+    """目標容量に合わせて録画の整理候補を提案する（ルールによる提案）。
+
+    戻り値:
+      items: [{"id", "kind": "duplicate"/"review", "label", "reasons", "size", "keep_id"}]
+      total（提案の合計）, target, shortage（不足分）, achieved,
+      duplicate_total, review_total, review_pool, excluded（対象外の内訳）
+    """
+    import time as _time
+    now_ts = now_ts or _time.time()
+    kinds = {"video", "image"} if include_images else {"video"}
+    rows = {i: r for i, r in ctx.rows.items() if r["kind"] in kinds}
+    excluded = {"保護": 0, "残す": 0, "オンライン専用": 0}
+
+    def usable(r) -> bool:
+        if r["id"] in ctx.aliases:  # 同じ実体の別表記は、提案の対象にも数にも入れない
+            return False
+        if r["protected"]:
+            excluded["保護"] += 1
+            return False
+        if r["decision"] == "残す":
+            excluded["残す"] += 1
+            return False
+        if r["cloud_only"]:
+            excluded["オンライン専用"] += 1
+            return False
+        return True
+
+    usable_ids = {i for i, r in rows.items() if usable(r)}
+    keep_ids = set()
+    dup_items = []
+    for h, members in ctx.dup_groups.items():
+        members = [m for m in members if m in rows]
+        if len(members) < 2:
+            continue
+        keep_id, why = ctx.dup_keep[h]
+        if keep_id not in members:
+            keep_id = members[0]
+        keep_ids.add(keep_id)
+        keep_name = ctx.rows[keep_id]["name"]
+        for m in members:
+            if m == keep_id or m not in usable_ids:
+                continue
+            r = rows[m]
+            dup_items.append({
+                "id": m, "kind": "duplicate", "label": "重複", "size": r["size"], "keep_id": keep_id,
+                "reasons": [f"「{keep_name}」と内容が完全に一致します（SHA-256 で確認）。"
+                            f"そちらを残すため、この1本を整理しても同じ録画は残ります（{why}）"]})
+    # 重複の中では大きいものから。目標に達したら、超えすぎた分を減らす
+    dup_items.sort(key=lambda it: -it["size"])
+    chosen, total = [], 0
+    for it in dup_items:
+        if total >= target_bytes:
+            break
+        chosen.append(it)
+        total += it["size"]
+    for it in sorted(list(chosen), key=lambda it: it["size"]):
+        if total - it["size"] >= target_bytes:
+            chosen.remove(it)
+            total -= it["size"]
+    review_pool = []
+    if total < target_bytes:
+        # 重複だけで届かない場合だけ、根拠のある「要確認」候補を追加する（残す1本は対象外）
+        for i in usable_ids - keep_ids - {it["id"] for it in dup_items}:
+            reasons = _review_reasons(rows[i], now_ts)
+            if reasons:
+                review_pool.append({"id": i, "kind": "review", "label": "要確認", "size": rows[i]["size"],
+                                    "keep_id": None, "reasons": reasons, "failure": bool(failures(rows[i]))})
+        review_pool.sort(key=lambda it: (not it["failure"], -it["size"]))
+        for it in review_pool:
+            if total >= target_bytes:
+                break
+            chosen.append(it)
+            total += it["size"]
+    dup_total = sum(it["size"] for it in chosen if it["kind"] == "duplicate")
+    return {"items": chosen, "total": total, "target": target_bytes, "shortage": max(target_bytes - total, 0),
+            "achieved": total >= target_bytes, "duplicate_total": dup_total, "review_total": total - dup_total,
+            "duplicate_pool": sum(it["size"] for it in dup_items), "review_pool": len(review_pool),
+            "excluded": excluded}

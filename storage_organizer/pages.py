@@ -1,4 +1,4 @@
-"""RecSort AI の追加画面（試作）。
+"""RecSort の動画AI（試作・初回リリースの対象外）の画面。
 
 重い処理（解析・ハッシュ・再学習・圧縮）は AppContext.run_task で別スレッド実行する。
 """
@@ -1756,6 +1756,9 @@ class SettingsPage(BasePage):
         sv = QVBoxLayout(scan_box)
         self.auto_start = QCheckBox("起動時に自動でスキャンする")
         sv.addWidget(self.auto_start)
+        self.experimental = QCheckBox("試作機能（動画AI: ジャンル分類・厳選の学習など）をメニューに表示する")
+        self.experimental.setToolTip("初回リリースの対象外の試作機能です。自動では実行しません。")
+        self.experimental.toggled.connect(self._toggle_experimental)
         self.path_lists = {}
         for key, title in (("excluded_folders", "スキャン対象外のフォルダ"),
                            ("extra_locations", "追加で調べる場所（外付け・ネットワークドライブやフォルダ）")):
@@ -1775,6 +1778,7 @@ class SettingsPage(BasePage):
         self.auto_start.toggled.connect(
             lambda on: self.ctx.db.set_setting("auto_scan_on_start", "1" if on else "0"))
         layout.addWidget(scan_box)
+        layout.addWidget(self.experimental)
         layout.addWidget(note_label(
             "AIの実装範囲: 実装済み＝映像（明るさ・黒画面・静止・動き・色）と音声（音量・無音率・簡易な音質）の"
             "数値特徴、教師データとの類似度による複数ジャンル推定、未分類判定、手動再学習、"
@@ -1786,6 +1790,10 @@ class SettingsPage(BasePage):
         check.clicked.connect(self._check)
         save.clicked.connect(self._save)
         reset.clicked.connect(self._reset)
+
+    def _toggle_experimental(self, on: bool) -> None:
+        self.ctx.db.set_setting("show_experimental", "1" if on else "0")
+        self.ctx.data_changed.emit()
 
     def _add_path(self, key: str, path: str | None = None) -> None:
         path = path or QFileDialog.getExistingDirectory(self, "フォルダ・ドライブを選択")
@@ -1808,6 +1816,9 @@ class SettingsPage(BasePage):
         self.auto_start.blockSignals(True)
         self.auto_start.setChecked(self.ctx.db.get_setting("auto_scan_on_start", "1") != "0")
         self.auto_start.blockSignals(False)
+        self.experimental.blockSignals(True)
+        self.experimental.setChecked(self.ctx.db.get_setting("show_experimental") == "1")
+        self.experimental.blockSignals(False)
         self.ffmpeg_dir.setText(self.ctx.db.get_setting("ffmpeg_dir", "") or "")
         self.frames.setValue(self.ctx.max_frames())
         self.data_label.setText(str(self.ctx.data_dir))

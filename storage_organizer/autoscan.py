@@ -210,6 +210,7 @@ def build_locations(db: Database, include_disabled: bool = False) -> tuple[list[
     disabled = set() if include_disabled else {norm(p) for p in db.json_list("disabled_locations")}
 
     def add(path, kind, label):
+        path = os.path.normpath(path)  # 表記を統一（C:/… と C:\… を同じ表記に）
         if norm(path) not in seen and norm(path) not in disabled and os.path.isdir(path):
             seen.add(norm(path))
             locations.append(Location(path, kind, label, len(locations)))
@@ -317,7 +318,7 @@ def scan_location(db: Database, loc: Location, skip_roots: list[str], gen: int, 
                 "bytes": totals["bytes"], "refresh": True})
         last = time.monotonic()
 
-    stack = [loc.path]
+    stack = [os.path.normpath(loc.path)]
     visited: set[str] = set()
     while stack:
         current = stack.pop()

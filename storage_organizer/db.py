@@ -159,6 +159,9 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 
+PATH_LIST_KEYS = ("extra_locations", "excluded_folders", "disabled_locations")
+
+
 def default_data_dir() -> Path:
     override = os.environ.get("RECSORT_DATA_DIR")
     if override:
@@ -213,7 +216,40 @@ class Database:
                         "INSERT INTO curation_labels(video_id,scope,genre_id,label,source,created_at) "
                         "VALUES (?,'all',NULL,?,'migrated',?)", (vid, label, now))
             self.conn.execute("INSERT INTO settings VALUES ('curation_migrated','1')")
+        if self.conn.execute("SELECT value FROM settings WHERE key='paths_normalized'").fetchone() is None:
+            self._normalize_paths()
+            self.conn.execute("INSERT INTO settings VALUES ('paths_normalized','1')")
         self.conn.commit()
+
+    def _normalize_paths(self) -> None:
+        """以前の版で C:/… のような別の表記で保存されたパスを統一する（1回だけ）。
+
+        同じファイルが2通りの表記で登録されていた場合は、統一した表記の行に保護・判断を引き継ぎ、
+        もう一方は非表示にする（記録は消さない）。
+        """
+        rows = self.conn.execute("SELECT id, path, folder, protected, favorite, decision FROM videos").fetchall()
+        for r in rows:
+            path = os.path.normpath(r["path"])
+            if path == r["path"]:
+                continue
+            other = self.conn.execute("SELECT id, protected, favorite, decision FROM videos WHERE path=?",
+                                      (path,)).fetchone()
+            if other is None:
+                self.conn.execute("UPDATE videos SET path=?, folder=? WHERE id=?",
+                                  (path, os.path.normpath(r["folder"]), r["id"]))
+                continue
+            self.conn.execute(
+                "UPDATE videos SET protected=MAX(protected, ?), favorite=MAX(favorite, ?), "
+                "decision=COALESCE(decision, ?) WHERE id=?",
+                (r["protected"], r["favorite"], r["decision"], other["id"]))
+            self.conn.execute("UPDATE videos SET missing=1 WHERE id=?", (r["id"],))
+        for key in PATH_LIST_KEYS:
+            row = self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            values = loads(row[0], []) if row else []
+            if values:
+                fixed = list(dict.fromkeys(os.path.normpath(v) for v in values))
+                self.conn.execute("UPDATE settings SET value=? WHERE key=?",
+                                  (json.dumps(fixed, ensure_ascii=False), key))
 
     def _seed(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM genres").fetchone()[0] == 0:
@@ -243,7 +279,7 @@ class Database:
         seen: set[str] = set()
         now = time.time()
         for r in records:
-            path = os.path.join(r.folder, r.name)
+            path = os.path.normpath(os.path.join(r.folder, r.name))  # 表記を統一
             seen.add(_norm(path))
             row = self.conn.execute("SELECT id,size,mtime FROM videos WHERE path=?",
                                     (path,)).fetchone()
@@ -251,7 +287,7 @@ class Database:
                 self.conn.execute(
                     "INSERT INTO videos(path,name,folder,size,mtime,ext,cloud_only,added_at) "
                     "VALUES (?,?,?,?,?,?,?,?)",
-                    (path, r.name, r.folder, r.size, r.mtime, os.path.splitext(r.name)[1].lower(),
+                    (path, r.name, os.path.normpath(r.folder), r.size, r.mtime, os.path.splitext(r.name)[1].lower(),
                      int(r.cloud_only), now))
                 added += 1
             else:
@@ -424,6 +460,7 @@ class Database:
         added = changed = 0
         now = time.time()
         for path, name, folder, size, mtime, ext, kind, cloud in records:
+            path, folder = os.path.normpath(path), os.path.normpath(folder)  # 表記を統一
             row = self.conn.execute("SELECT id,size,mtime,trashed_at FROM videos WHERE path=?",
                                     (path,)).fetchone()
             if row is None:
@@ -486,6 +523,8 @@ class Database:
         return loads(self.get_setting(key), []) or []
 
     def set_json_list(self, key: str, values: list[str]) -> None:
+        if key in PATH_LIST_KEYS:  # 場所の一覧は表記を統一して重複を除く
+            values = list(dict.fromkeys(os.path.normpath(v) for v in values))
         self.set_setting(key, json.dumps(values, ensure_ascii=False))
 
     # --- ジャンル ---------------------------------------------------------

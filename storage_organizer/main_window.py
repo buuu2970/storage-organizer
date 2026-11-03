@@ -29,7 +29,7 @@ from .db import Database
 from .file_table_model import COL_CATEGORY, COL_MTIME, COL_NAME, COL_SIZE, FileTableModel
 from .formatting import format_bytes_exact, format_duration, format_size
 from . import theme
-from .organizer import HomePage, LocationsDialog, MediaBrowser, MediaState, ScanStatus
+from .organizer import HomePage, LocationsDialog, MediaBrowser, MediaState, PlanPage, ScanStatus
 from .scan_worker import ScanWorker
 from .scanner import ScanProgress, ScanResult
 
@@ -279,8 +279,8 @@ class ScanPage(QWidget):
 # =============================================================================
 # メインウィンドウ
 # =============================================================================
-NAV_ITEMS = [("home", "ホーム"), ("files", "ファイル一覧"), ("sparkle", "整理のおすすめ"), ("video", "動画AI"),
-             ("settings", "設定")]
+NAV_ITEMS = [("home", "ホーム"), ("target", "整理候補"), ("files", "ファイル一覧"), ("sparkle", "その他の整理"),
+             ("settings", "設定"), ("video", "動画AI（試作）")]
 RECOMMEND_KEYS = ["重複", "類似画像", "録画確認候補", "大容量", "削除候補"]
 
 
@@ -345,14 +345,15 @@ class VideoAIPage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, db: Database | None = None, start_autoscan: bool = True) -> None:
         super().__init__()
-        self.setWindowTitle("RecSort — 録画・画像の整理支援")
+        self.setWindowTitle("RecSort — 録画の整理")
         self.resize(1280, 800)
         self.setMinimumSize(880, 520)
-        self.ask_initial_learning = True  # 従来のフォルダ指定スキャン後に初期学習を案内するか（テストでは False）
+        self.ask_initial_learning = False  # 動画AI（試作）は初回リリースの対象外のため、自動で案内しない
         self.ctx = pages.AppContext(db or Database())
         c = self.ctx
         self.state = MediaState(c.db, c.tools)
         self.home = HomePage(self.state)
+        self.plan = PlanPage(self.state)
         self.files = MediaBrowser(self.state, "files")
         self.recommend = MediaBrowser(self.state, "recommend")
         self.scan_page = ScanPage()
@@ -377,7 +378,7 @@ class MainWindow(QMainWindow):
         settings_scroll.setWidget(self.settings)
         self.settings_page = TitledPage("設定", "FFmpeg の場所、自動スキャンの対象・対象外、AI のリセットなど。",
                                         settings_scroll)
-        self.sections = [self.home, self.files, self.recommend, self.video_ai, self.settings_page]
+        self.sections = [self.home, self.plan, self.files, self.recommend, self.settings_page, self.video_ai]
         self.page_widgets = self.sections
 
         central = QWidget()
@@ -419,9 +420,12 @@ class MainWindow(QMainWindow):
 
         self.nav.currentRowChanged.connect(self._on_nav)
         self.scan_status.rescan.clicked.connect(self.start_scan)
-        self.home.start_organizing.connect(self.show_category)
-        for w in (self.home, self.files, self.recommend):
+        self.home.start_plan.connect(self.show_plan)
+        for w in (self.home, self.plan, self.files, self.recommend):
             w.request_locations.connect(self.open_locations)
+        for w in (self.home, self.plan):
+            w.request_settings.connect(lambda: self.show_section(self.settings_page))
+        c.data_changed.connect(self._update_experimental)
         self.home.request_files.connect(lambda: self.show_section(self.files))
         self.recommend.request_files.connect(lambda: self.show_section(self.files))
         self.files.request_files.connect(lambda: self.show_section(self.files))
@@ -430,6 +434,7 @@ class MainWindow(QMainWindow):
         c.open_compress_requested.connect(self.open_compress)
         self.detail.back_requested.connect(lambda: self.show_page(self.video_list))
         self.state.runner.finished.connect(lambda _: c.data_changed.emit())
+        self._update_experimental()
         self.nav.setCurrentRow(0)
         # 初回（一度も調査していない）は「調べる場所を選ぶ」から始める。2回目以降は起動時に自動で更新する
         if (start_autoscan and c.db.get_setting("auto_scan_on_start", "1") != "0"
@@ -444,9 +449,29 @@ class MainWindow(QMainWindow):
                 self.files.stop_media()
             if self.sections[row] is not self.recommend:
                 self.recommend.stop_media()
+            if self.sections[row] is not self.plan:
+                self.plan.stop_media()
 
     def show_section(self, widget) -> None:
-        self.nav.setCurrentRow(self.sections.index(widget))
+        row = self.sections.index(widget)
+        if self.nav.item(row).isHidden():  # 試作機能はメニューに出していなくても既存の導線から開ける
+            self.nav.blockSignals(True)
+            self.nav.setCurrentRow(row)  # 隠れた項目を現在の項目にして、先頭が自動で選び直されないようにする
+            self.nav.blockSignals(False)
+            self.stack.setCurrentWidget(widget)
+            return
+        self.nav.setCurrentRow(row)
+
+    def show_plan(self, target_gb: float | None = None) -> None:
+        """整理候補を表示する（ホームで入力した目標容量で提案する）。"""
+        if target_gb is not None:
+            self.plan.set_target_gb(target_gb)
+        self.show_section(self.plan)
+
+    def _update_experimental(self) -> None:
+        """動画AI（試作）は、設定で表示をオンにしたときだけメニューに出す。"""
+        show = self.ctx.db.get_setting("show_experimental") == "1"
+        self.nav.item(self.sections.index(self.video_ai)).setHidden(not show)
 
     def show_page(self, widget) -> None:
         """既存の画面へ移動する（動画AIの各画面・設定・整理画面）。"""
@@ -525,6 +550,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.files.stop_media()
         self.recommend.stop_media()
+        self.plan.stop_media()
         self.state.close()
         self.scan_page.shutdown()
         self.ctx.shutdown()

@@ -485,7 +485,9 @@ class OrganizerGuiTest(unittest.TestCase):
     def test_navigation_has_five_sections_and_reaches_all_pages(self):
         w = self.w
         self.assertEqual([w.nav.item(i).data(0x0100) for i in range(w.nav.count())],
-                         ["ホーム", "ファイル一覧", "整理のおすすめ", "動画AI", "設定"])
+                         ["ホーム", "整理候補", "ファイル一覧", "その他の整理", "設定", "動画AI（試作）"])
+        self.assertTrue(w.nav.item(5).isHidden())  # 動画AI（試作）は通常メニューに出さない
+        self.assertFalse(w.ask_initial_learning)
         for page in (w.dashboard, w.video_list, w.initial, w.unclassified, w.curation, w.review,
                      w.genre_page, w.duplicates, w.compress, w.scan_page, w.settings):
             w.show_page(page)
@@ -506,7 +508,7 @@ class OrganizerGuiTest(unittest.TestCase):
         self.assertEqual(w.home.primary.text(), "調べる場所を選ぶ")
         self.assertEqual(w.home.total.value.text(), "未調査")
         self.assertEqual(w.home.saving.value.text(), "算出できません")
-        self.assertIn("ドライブ全体の使用量ではありません", w.home.total.detail.text())
+        self.assertIn("実際の値", w.home.free.detail.text())
         w.show_section(w.files)
         self.assertIs(w.files.content.currentWidget(), w.files.empty)
         self.assertEqual(w.files.empty.action.text(), "調べる場所を選ぶ")
@@ -530,13 +532,15 @@ class OrganizerGuiTest(unittest.TestCase):
     def test_home_after_scan(self):
         self.scan()
         home = self.w.home
-        total = sum(r["size"] for r in self.state.ctx.rows.values())
-        self.assertEqual(home.primary.text(), "整理をはじめる")
-        self.assertEqual(home.total.value.text(), format_size(total))
+        total = sum(r["size"] for r in self.state.ctx.rows.values() if r["kind"] == "video")
+        self.assertEqual(home.primary.text(), "整理候補を見る")
+        self.assertEqual(home.total.value.text(), format_size(total))  # 録画（動画）だけの合計
+        self.assertIn("ドライブ全体の使用量とは別", home.total.detail.text())
         self.assertNotEqual(home.saving.value.text(), "算出できません")
-        self.assertIn("別の値", home.drive.detail.text())
+        home.target.setValue(3.5)
         home.primary.click()
-        self.assertIs(self.w.stack.currentWidget(), self.w.recommend)
+        self.assertIs(self.w.stack.currentWidget(), self.w.plan)
+        self.assertEqual(self.w.plan.target.value(), 3.5)
         self.assertIn("調査完了", self.w.scan_status.text.text())
 
     def test_files_detail_selection_bar_and_views(self):
@@ -667,6 +671,420 @@ class OrganizerGuiTest(unittest.TestCase):
                 self.assertGreaterEqual(b.width(), b.sizeHint().width() - 2, f"{b.text()} が切れています")
             self.assertTrue(w.scan_status.rescan.isVisible())
             self.assertLessEqual(w.files.detail.width(), w.files.width())
+
+
+class PlanEngineTest(unittest.TestCase):
+    """目標容量に合わせた録画の整理候補（ルールによる提案）。"""
+
+    GB = 1024 ** 3
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self._tmp.name) / "data")
+        self.now = time.time()
+        self.rows = {}
+
+    def tearDown(self):
+        self.db.close()
+        self._tmp.cleanup()
+
+    def add(self, name, size, days_old=1, sha=None, kind="video", duration=600, failure=None):
+        path = str(Path(self._tmp.name) / name)
+        mtime = self.now - days_old * 86400
+        self.db.upsert_media([(path, name, self._tmp.name, size, mtime, ".mp4", kind, False)], 1, self._tmp.name)
+        mid = self.db.conn.execute("SELECT id FROM videos WHERE path=?", (path,)).fetchone()[0]
+        self.db.update_video(mid, sha256=sha, meta={"duration": duration, "has_video": True},
+                             failure=[failure] if failure else [])
+        self.rows[name] = mid
+        return mid
+
+    def plan(self, target_gb, **kw):
+        return candidates.plan_recordings(candidates.Context(self.db), int(target_gb * self.GB), now_ts=self.now, **kw)
+
+    def names(self, plan):
+        return {self.db.video(it["id"])["name"]: it for it in plan["items"]}
+
+    def make_duplicates(self):
+        self.add("a_original.mp4", 1 * self.GB, days_old=30, sha="A")
+        self.add("a_copy1.mp4", 1 * self.GB, days_old=10, sha="A")
+        self.add("a_copy2.mp4", 1 * self.GB, days_old=5, sha="A")
+        self.add("b_original.mp4", 2 * self.GB, days_old=20, sha="B")
+        self.add("b_copy.mp4", 2 * self.GB, days_old=2, sha="B")
+
+    def test_duplicates_first_and_one_copy_always_kept(self):
+        self.make_duplicates()
+        self.add("big_old.mp4", 3 * self.GB, days_old=800)  # 要確認になりうるが、重複で足りるので出さない
+        p = self.plan(2)
+        names = self.names(p)
+        self.assertTrue(p["achieved"])
+        self.assertEqual({it["kind"] for it in p["items"]}, {"duplicate"})
+        self.assertEqual(set(names), {"b_copy.mp4"})  # 目標に最も近く、超えすぎない
+        all_dup = self.plan(4)
+        names = set(self.names(all_dup))
+        self.assertNotIn("a_original.mp4", names)  # 各グループで最も古い1本を残す
+        self.assertNotIn("b_original.mp4", names)
+        self.assertEqual(names, {"a_copy1.mp4", "a_copy2.mp4", "b_copy.mp4"})
+        for it in all_dup["items"]:
+            self.assertIn("SHA-256", it["reasons"][0])
+            self.assertIsNotNone(it["keep_id"])
+
+    def test_protected_kept_and_cloud_are_excluded(self):
+        self.make_duplicates()
+        self.db.set_protected(self.rows["a_copy1.mp4"], True)
+        self.db.set_decision(self.rows["a_copy2.mp4"], "残す")
+        self.db.conn.execute("UPDATE videos SET cloud_only=1 WHERE id=?", (self.rows["b_copy.mp4"],))
+        self.db.conn.commit()
+        p = self.plan(10)
+        names = self.names(p)
+        # 保護したコピーを「残す1本」にするので、元のファイルは重複分として提案してよい
+        self.assertEqual(set(names), {"a_original.mp4"})
+        self.assertEqual(names["a_original.mp4"]["keep_id"], self.rows["a_copy1.mp4"])
+        self.assertEqual(p["excluded"], {"保護": 1, "残す": 1, "オンライン専用": 1})
+        self.assertFalse(p["achieved"])
+        self.assertEqual(p["shortage"], 9 * self.GB)  # 無理に候補を足さず、不足分を表示
+
+    def test_review_candidates_only_when_duplicates_are_not_enough(self):
+        self.make_duplicates()
+        self.add("huge.mp4", 4 * self.GB, days_old=3)
+        self.add("old_mid.mp4", 300 * 1024 ** 2, days_old=500)
+        self.add("broken_rec.mp4", 10 * 1024 ** 2, failure={"kind": "short", "reason": "再生時間が 1.0 秒と極端に短い録画です"})
+        self.add("small_new.mp4", 20 * 1024 ** 2, days_old=3)    # 理由がないので候補にしない
+        self.add("old_tiny.mp4", 1 * 1024 ** 2, days_old=900)    # 古いだけの小さなファイルも候補にしない
+        p = self.plan(8)
+        names = self.names(p)
+        self.assertTrue(p["achieved"])
+        self.assertEqual(p["duplicate_total"], 4 * self.GB)
+        self.assertEqual(names["huge.mp4"]["label"], "要確認")
+        self.assertIn("容量が大きい", names["huge.mp4"]["reasons"][0])
+        self.assertIn("broken_rec.mp4", names)  # 失敗した可能性のある録画を先に
+        p = self.plan(100)
+        names = self.names(p)
+        self.assertFalse(p["achieved"])
+        self.assertGreater(p["shortage"], 0)
+        self.assertIn("old_mid.mp4", names)
+        self.assertIn("更新されていません", names["old_mid.mp4"]["reasons"][0])
+        self.assertIn("視聴したかどうかは分かりません", names["old_mid.mp4"]["reasons"][0])
+        self.assertNotIn("small_new.mp4", names)
+        self.assertNotIn("old_tiny.mp4", names)
+        for it in p["items"]:
+            text = " ".join(it["reasons"])
+            self.assertTrue(it["reasons"] and it["size"] > 0)
+            self.assertNotIn("不要", text)
+            self.assertNotIn("AI", text)
+
+    def test_kept_copy_is_never_a_review_candidate(self):
+        self.add("orig.mp4", 2 * self.GB, days_old=800, sha="X")  # 大きくて古いが、重複の「残す1本」
+        self.add("copy.mp4", 2 * self.GB, days_old=1, sha="X")
+        names = self.names(self.plan(100))
+        self.assertIn("copy.mp4", names)
+        self.assertNotIn("orig.mp4", names)
+
+    def test_images_are_not_included_by_default(self):
+        self.add("pic1.jpg", 1 * self.GB, sha="P", kind="image")
+        self.add("pic2.jpg", 1 * self.GB, sha="P", kind="image")
+        self.assertEqual(self.plan(1)["items"], [])
+        self.assertEqual(len(self.plan(1, include_images=True)["items"]), 1)
+
+    def test_drive_space_is_reported_per_drive(self):
+        spaces = candidates.drive_space([self._tmp.name, self._tmp.name])
+        self.assertEqual(len(spaces), 1)
+        self.assertGreater(spaces[0]["total"], 0)
+
+
+class SurvivorCheckTest(unittest.TestCase):
+    """最終確認時に、重複の最後の1本がディスクに実在するかを確かめる。"""
+
+    def setUp(self):
+        self.env = Env(with_videos=False)
+        self.env.run()
+        self.db = Database(self.env.data)
+        self.by = {r["path"]: r["id"] for r in self.db.media()}
+        self.moved = []
+
+    def tearDown(self):
+        self.db.close()
+        self.env.close()
+
+    def backend(self, path):
+        self.moved.append(path)
+        os.rename(path, path + ".trashed-by-test")
+
+    def test_copy_is_not_moved_when_the_other_copy_disappeared(self):
+        keep = self.env.home / "Pictures" / "photo.jpg"
+        copy = self.by[str(self.env.home / "Downloads" / "photo_copy.jpg")]
+        os.rename(keep, str(keep) + ".moved-away")  # スキャン後に、残すはずのファイルがなくなった
+        results = trash.move_to_trash(self.db, [copy], self.backend)
+        self.assertFalse(results[0].ok)
+        self.assertIn("最後の1本", results[0].message)
+        self.assertEqual(self.moved, [])
+
+    def test_copy_is_not_moved_when_the_other_copy_changed(self):
+        keep = self.env.home / "Pictures" / "photo.jpg"
+        copy = self.by[str(self.env.home / "Downloads" / "photo_copy.jpg")]
+        with open(keep, "ab") as f:
+            f.write(b"edited")
+        results = trash.move_to_trash(self.db, [copy], self.backend)
+        self.assertFalse(results[0].ok)
+        self.assertEqual(self.moved, [])
+
+    def test_partial_failure_is_reported_separately(self):
+        ids = [self.by[str(self.env.home / "Downloads" / "photo_copy.jpg")],
+               self.by[str(self.env.home / "Pictures" / "other.png")]]
+
+        def flaky(path):
+            if path.endswith("other.png"):
+                raise trash.TrashError("ごみ箱へ移動できませんでした（テスト）")
+            self.backend(path)
+        results = trash.move_to_trash(self.db, ids, flaky)
+        self.assertEqual([r.ok for r in results], [True, False])
+        self.assertTrue((self.env.home / "Pictures" / "other.png").exists())
+
+
+class SameFileTest(unittest.TestCase):
+    """同じ実体のファイル（別の表記・ハードリンク）を重複として扱わない。実際には1本しかない録画を守る。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name) / "videos"
+        self.dir.mkdir()
+        self.file = self.dir / "rec.mp4"
+        self.file.write_bytes(b"recording" * 1000)
+        self.data = Path(self._tmp.name) / "data"
+        self.db = Database(self.data)
+        self.moved = []
+
+    def tearDown(self):
+        self.db.close()
+        self._tmp.cleanup()
+
+    def insert(self, path: str, sha="S"):
+        """以前の版のように、表記を統一せずに登録する（移行前のデータの再現）。"""
+        st = os.stat(path)
+        self.db.conn.execute(
+            "INSERT INTO videos(path,name,folder,size,mtime,ext,added_at,kind,location,sha256) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (path, os.path.basename(path), os.path.dirname(path), st.st_size, st.st_mtime, ".mp4", time.time(),
+             "video", str(self.dir), sha))
+        self.db.conn.commit()
+        return self.db.conn.execute("SELECT id FROM videos WHERE path=?", (path,)).fetchone()[0]
+
+    def backend(self, path):
+        self.moved.append(path)
+        os.rename(path, path + ".trashed-by-test")
+
+    def test_same_file_with_two_spellings_is_not_a_duplicate(self):
+        a = self.insert(str(self.file))
+        b = self.insert(str(self.dir) + os.sep + "." + os.sep + "rec.mp4")  # 別の表記（C:/… と C:\… に相当）
+        ctx = candidates.Context(self.db)
+        self.assertEqual(ctx.dup_groups, {})
+        self.assertEqual(ctx.aliases, {b: a})
+        self.assertIn("二重に登録", " ".join(ctx.reasons(ctx.rows[b])))
+        plan = candidates.plan_recordings(ctx, 10 ** 9)
+        self.assertEqual(plan["items"], [])
+        results = trash.move_to_trash(self.db, [b], self.backend)  # 直接指定しても移動しない
+        self.assertFalse(results[0].ok)
+        self.assertEqual(self.moved, [])
+        self.assertTrue(self.file.exists())
+
+    def test_hard_link_is_not_a_duplicate(self):
+        link = self.dir / "rec_link.mp4"
+        try:
+            os.link(self.file, link)
+        except OSError:
+            self.skipTest("ハードリンクを作れない環境")
+        self.insert(str(self.file))
+        self.insert(str(link))
+        ctx = candidates.Context(self.db)
+        self.assertEqual(ctx.dup_groups, {})  # 消しても容量が空かず、同じ実体を失うおそれがある
+        self.assertEqual(candidates.plan_recordings(ctx, 10 ** 9)["items"], [])
+
+    def test_real_copy_is_still_a_duplicate(self):
+        copy = self.dir / "rec_copy.mp4"
+        shutil.copyfile(self.file, copy)
+        a = self.insert(str(self.file))
+        b = self.insert(str(self.dir) + os.sep + "." + os.sep + "rec.mp4")
+        c = self.insert(str(copy))
+        ctx = candidates.Context(self.db)
+        group = next(iter(ctx.dup_groups.values()))
+        self.assertEqual(sorted(group), sorted([a, c]))  # 別の表記の b は含めない
+        plan = candidates.plan_recordings(ctx, 10 ** 9)
+        self.assertEqual(len(plan["items"]), 1)
+        self.assertNotIn(b, [it["id"] for it in plan["items"]])
+
+    def test_existing_data_is_normalized_once(self):
+        canonical = self.insert(str(self.file))
+        alias = self.insert(str(self.dir) + os.sep + "." + os.sep + "rec.mp4")
+        other = self.dir / "other.mp4"
+        other.write_bytes(b"x" * 10)
+        lonely = self.insert(str(self.dir) + os.sep + "." + os.sep + "other.mp4", sha=None)
+        self.db.set_protected(alias, True)
+        self.db.set_decision(alias, "保留")
+        self.db.conn.execute("DELETE FROM settings WHERE key='paths_normalized'")
+        self.db.conn.execute("UPDATE settings SET value=? WHERE key='extra_locations'", ("[]",))
+        self.db.conn.execute("INSERT OR REPLACE INTO settings VALUES ('extra_locations', ?)",
+                             (f'["{self.dir.as_posix()}/./", "{self.dir.as_posix()}"]',))
+        self.db.conn.commit()
+        self.db.close()
+        self.db = Database(self.data)
+        row = self.db.video(canonical)
+        self.assertTrue(row["protected"])        # 保護と判断を引き継ぐ
+        self.assertEqual(row["decision"], "保留")
+        self.assertTrue(self.db.video(alias)["missing"])  # 別の表記の行は非表示（記録は残す）
+        self.assertEqual(self.db.video(lonely)["path"], str(other))
+        self.assertEqual(self.db.json_list("extra_locations"), [os.path.normpath(str(self.dir))])
+
+    def test_new_scans_store_one_spelling(self):
+        self.db.set_json_list("extra_locations", [str(self.dir) + os.sep + "." + os.sep])
+        self.assertEqual(self.db.json_list("extra_locations"), [str(self.dir)])
+        self.db.close()
+        with mock.patch.object(autoscan, "known_folders", lambda: []), \
+                mock.patch.object(autoscan, "local_drives", lambda: []):
+            autoscan.task_autoscan(self.data, FFMPEG, autoscan.Controller(), lambda p: None)
+        self.db = Database(self.data)
+        paths = [r["path"] for r in self.db.media()]
+        self.assertEqual(paths, [str(self.file)])
+
+
+@unittest.skipIf(QApplication is None, "PySide6 がありません")
+class PlanGuiTest(unittest.TestCase):
+    """ホーム → 整理候補 → 内容確認 → 最終確認。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from storage_organizer import theme
+        cls.app = QApplication.instance() or QApplication([])
+        theme.apply(cls.app)
+
+    def setUp(self):
+        from storage_organizer.main_window import MainWindow
+        self.env = Env()
+        if FFMPEG.available:
+            shutil.copyfile(self.env.home / "Videos" / "normal.mp4", self.env.home / "Downloads" / "normal (1).mp4")
+        self.messages = []
+        ans = lambda *a, **k: (self.messages.append(a[1:3]) or QMessageBox.StandardButton.Yes)  # noqa: E731
+        self.mb = [mock.patch.object(QMessageBox, n, staticmethod(ans)) for n in ("information", "warning", "question")]
+        self.large = mock.patch.object(candidates, "REVIEW_LARGE_BYTES", 40 * 1024)  # 小さなテスト用録画でも確認
+        for p in self.mb + [self.large]:
+            p.start()
+        self.w = MainWindow(Database(self.env.data), start_autoscan=False)
+        self.w.resize(1280, 800)
+        self.w.show()
+        self.w.start_scan()
+        self.assertTrue(wait_until(lambda: self.w.state.runner.is_running(), 10))
+        self.assertTrue(wait_until(lambda: not self.w.state.runner.is_running(), 120))
+        QCoreApplication.processEvents()
+
+    def tearDown(self):
+        self.w.close()
+        self.w.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        for p in self.mb + [self.large]:
+            p.stop()
+        self.env.close()
+
+    def plan_with(self, gb):
+        p = self.w.plan
+        p.target.setDecimals(4)
+        p.target.setMinimum(0)
+        p.set_target_gb(gb)
+        QCoreApplication.processEvents()
+        return p
+
+    def child(self, p, name):
+        for i in range(p.tree.topLevelItemCount()):
+            top = p.tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                if top.child(j).text(0) == name:
+                    return top.child(j)
+        return None
+
+    @unittest.skipUnless(FFMPEG.available, "FFmpeg がありません")
+    def test_plan_reasons_status_selection_and_final_confirm(self):
+        from storage_organizer import organizer
+        w = self.w
+        w.show_plan(None)
+        p = self.plan_with(0.0002)
+        dup = self.child(p, "normal (1).mp4")
+        self.assertIsNotNone(dup)
+        self.assertEqual(dup.checkState(0), Qt.CheckState.Checked)  # 重複は提案どおり選択
+        review = self.child(p, "short.mp4")
+        self.assertEqual(review.checkState(0), Qt.CheckState.Unchecked)  # 要確認は内容を見てから
+        self.assertIn("極端に短い", review.text(2))
+        self.assertIsNone(self.child(p, "normal.mp4"))  # 残す1本は候補にしない
+        self.assertIn(p.status_card.value.text().split()[0], ("達成できます", "不足"))
+        self.assertIn("ファイルサイズ", p.total_card.body.itemAt(0).layout().itemAt(1).widget().text())
+        self.assertIn("実際", p.free_card.detail.text())
+        # 内容確認（プレビュー・情報・提案の理由）
+        p.tree.setCurrentItem(review)
+        QCoreApplication.processEvents()
+        self.assertTrue(p.detail.isVisible())
+        self.assertIn("極端に短い", p.detail.reasons.text())
+        self.assertGreater(p.detail.info_form.rowCount(), 3)
+        # 保護すると提案から外れ、起動し直しても残る
+        pid = review.data(0, Qt.ItemDataRole.UserRole)
+        p.protect_button.click()
+        self.assertIsNone(self.child(p, "short.mp4"))
+        self.assertTrue(w.ctx.db.video(pid)["protected"])
+        # 最終確認（モックのごみ箱）。一部失敗は分けて報告
+        dark = self.child(p, "dark.mp4")
+        dark.setCheckState(0, Qt.CheckState.Checked)
+        moved = []
+
+        def backend(path):
+            if path.endswith("dark.mp4"):
+                raise trash.TrashError("テスト用の失敗")
+            moved.append(path)
+            os.rename(path, path + ".trashed-by-test")
+
+        def run_dialog(dlg):
+            dlg.backend = backend
+            self.assertIn("ごみ箱を空にするまで", dlg.summary.text())
+            dlg.execute()
+            return 1
+        with mock.patch.object(organizer.TrashDialog, "exec", run_dialog):
+            p.final_button.click()
+        self.assertEqual(len(moved), 1)
+        report = str(self.messages[-1])
+        self.assertIn("ごみ箱へ移動: 1 件", report)
+        self.assertIn("移動しなかった: 1 件", report)
+        db_path = w.ctx.data_dir
+        self.w.close()
+        db = Database(db_path)
+        self.assertTrue(db.video(pid)["protected"])
+        self.assertEqual(db.conn.execute("SELECT decision FROM videos WHERE name='dark.mp4'").fetchone()[0], "削除候補")
+        db.close()
+
+    def test_preview_failure_still_shows_information_and_reasons(self):
+        w = self.w
+        w.show_section(w.files)
+        f = w.files
+        i = next(i for i, it in enumerate(f.model.items) if it["name"] == "notimage.jpg")
+        f.view.setCurrentIndex(f.model.index(i, 0))
+        QCoreApplication.processEvents()
+        self.assertIs(f.detail.preview_stack.currentWidget(), f.detail.preview_msg)
+        self.assertIn("プレビューできません", f.detail.preview_msg.title.text())
+        self.assertGreater(f.detail.info_form.rowCount(), 3)
+        self.assertIn("読み込めません", f.detail.reasons.text())
+
+    def test_ffmpeg_missing_is_guided_to_settings(self):
+        w = self.w
+        with mock.patch.object(media, "find_ffmpeg", lambda *a, **k: media.FFmpegTools(None, None)):
+            w.home.refresh()
+            self.assertTrue(w.home.banner.isVisibleTo(w.home))
+            w.home.banner.open_settings.emit()
+            self.assertIs(w.stack.currentWidget(), w.settings_page)
+            w.plan.replan()
+            self.assertTrue(w.plan.banner.isVisibleTo(w.plan))
+
+    def test_experimental_menu_toggle(self):
+        w = self.w
+        row = w.sections.index(w.video_ai)
+        self.assertTrue(w.nav.item(row).isHidden())
+        w.settings.experimental.setChecked(True)
+        QCoreApplication.processEvents()
+        self.assertFalse(w.nav.item(row).isHidden())
+        w.show_page(w.video_list)  # 既存の導線
+        self.assertIs(w.stack.currentWidget(), w.video_ai)
 
 
 if __name__ == "__main__":
