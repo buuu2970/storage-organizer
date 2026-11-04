@@ -1,0 +1,84 @@
+{
+ "signature_seconds_avg": 0.967,
+ "per_set": {
+  "学習用": {
+   "同じ録画の組": 9,
+   "見つけた": 9,
+   "見逃し": 0,
+   "別の動画の組": 75,
+   "誤ってまとめた": 0,
+   "判定できない": 0,
+   "対象外（編集・同じタイトル同士）": 21,
+   "検出率": 1.0
+  },
+  "検証用": {
+   "同じ録画の組": 9,
+   "見つけた": 9,
+   "見逃し": 0,
+   "別の動画の組": 75,
+   "誤ってまとめた": 0,
+   "判定できない": 0,
+   "対象外（編集・同じタイトル同士）": 21,
+   "検出率": 1.0
+  },
+  "再検証用": {
+   "同じ録画の組": 9,
+   "見つけた": 9,
+   "見逃し": 0,
+   "別の動画の組": 75,
+   "誤ってまとめた": 0,
+   "判定できない": 0,
+   "対象外（編集・同じタイトル同士）": 21,
+   "検出率": 1.0
+  }
+ },
+ "errors": [],
+ "groups": [
+  [
+   "H_orig",
+   "H_lowres",
+   "H_recompress"
+  ],
+  [
+   "D_orig",
+   "D_lowres",
+   "D_recompress"
+  ],
+  [
+   "I_orig",
+   "I_lowres",
+   "I_recompress"
+  ],
+  [
+   "B_orig",
+   "B_lowres",
+   "B_recompress"
+  ],
+  [
+   "E_orig",
+   "E_lowres",
+   "E_recompress"
+  ],
+  [
+   "A_orig",
+   "A_lowres",
+   "A_recompress"
+  ],
+  [
+   "C_orig",
+   "C_lowres",
+   "C_recompress"
+  ],
+  [
+   "G_orig",
+   "G_lowres",
+   "G_recompress"
+  ],
+  [
+   "F_orig",
+   "F_lowres",
+   "F_recompress"
+  ]
+ ],
+ "mixed_groups": []
+}
