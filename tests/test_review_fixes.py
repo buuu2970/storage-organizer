@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -106,6 +107,7 @@ class InstanceLockTest(unittest.TestCase):
             lock = InstanceLock(t).acquire()  # 異常終了後も再起動できる
             lock.release()
 
+    @unittest.skipUnless(importlib.util.find_spec("PySide6"), "PySide6 がありません（二重起動の画面まで到達できない）")
     def test_second_app_instance_exits_without_touching_data(self):
         with tempfile.TemporaryDirectory() as t:
             user = Path(t) / "user_state.json"

@@ -150,13 +150,31 @@ def _stat(path: str):
 def move_to_trash(db: Database, ids: list[int], backend: Callable[[str], None] | None = None,
                   progress: Callable[[int, int, str], None] | None = None, cancel=None,
                   expected_generation: int | None = None) -> list[TrashResult]:
-    """確認済みのファイルをごみ箱へ移動する。1件ずつ確認・移動し、結果を返す。"""
+    """確認済みのファイルをごみ箱へ移動する。1件ずつ確認・移動し、結果を返す。
+
+    同じ保存データに対する整理は同時に1つだけ。調査中・ほかの整理の実行中は、何も移動せずに止める
+    （「実行中か確かめる」と「実行中にする」を Store.begin_activity で1度に行う）。
+    """
     backend = backend or default_backend()
     def stop_all(message):
         return [TrashResult(m, (db.video(m) or {}).get("path", ""), (db.video(m) or {}).get("size", 0), False, message)
                 for m in ids]
-    if getattr(db, "scan_active", False):  # 調査と整理は同時に行わない（処理側でも防ぐ）
-        return stop_all("調査中のため移動しませんでした。調査が終わってから、もう一度確認してください")
+    if not hasattr(db, "begin_activity"):  # 排他の仕組みを持たない保存先では移動しない（安全側）
+        return stop_all("整理の同時実行を防げないため、移動しませんでした")
+    token = db.begin_activity("organize")
+    if token is None:
+        if getattr(db, "scan_active", False):  # 調査と整理は同時に行わない（処理側でも防ぐ）
+            return stop_all("調査中のため移動しませんでした。調査が終わってから、もう一度確認してください")
+        return stop_all("ほかの整理（ごみ箱への移動）が実行中のため、移動しませんでした。終わってから、もう一度確認してください")
+    try:
+        return _move_checked(db, ids, backend, progress, cancel, expected_generation, stop_all)
+    finally:
+        db.end_activity(token)  # 自分が取った権利だけを返す（例外・中断でも必ず返す）
+
+
+def _move_checked(db: Database, ids: list[int], backend, progress, cancel, expected_generation,
+                  stop_all) -> list[TrashResult]:
+    """整理の権利を取った後の処理（世代・保護情報の確認 → 確認時点の記録 → 1件ずつ移動）。"""
     if expected_generation is not None and getattr(db, "generation", 0) != expected_generation:
         return stop_all("確認したあとに調査結果が更新されました。内容が変わった可能性があるため、もう一度確認してください")
     if not getattr(db, "protection_ok", True):  # 保護情報が読めない状態で「保護なし」として整理しない
@@ -189,14 +207,8 @@ def move_to_trash(db: Database, ids: list[int], backend: Callable[[str], None] |
             snapshot[m] = None
         else:
             snapshot[m] = (row["path"], st)
-    if hasattr(db, "organize_active"):
-        db.organize_active = True
-    try:
-        return _move_all(db, ctx, ids, backend, progress, cancel, blocked, similar_blocked, snapshot,
-                         start_generation, results, moved_identities)
-    finally:
-        if hasattr(db, "organize_active"):
-            db.organize_active = False
+    return _move_all(db, ctx, ids, backend, progress, cancel, blocked, similar_blocked, snapshot,
+                     start_generation, results, moved_identities)
 
 
 def _move_all(db, ctx, ids, backend, progress, cancel, blocked, similar_blocked, snapshot, start_generation,

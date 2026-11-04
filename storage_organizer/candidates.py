@@ -43,7 +43,7 @@ def dhash(img) -> str:
     """縮小・再圧縮・軽い編集に強い知覚ハッシュ（64ビット）。"""
     from PIL import Image
     small = img.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
-    px = list(small.getdata())
+    px = list(small.tobytes())  # 白黒（L）なので1画素1バイト。getdata() は Pillow 14 で廃止予定
     bits = 0
     for row in range(8):
         for col in range(8):

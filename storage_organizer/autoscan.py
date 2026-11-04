@@ -584,10 +584,15 @@ def task_autoscan(data, tools: media.FFmpegTools, ctl: Controller, report) -> di
     own = not isinstance(data, Store)
     db = Store(data) if own else data
     summary = {"cancelled": False, "statuses": {}}
-    if db.organize_active:  # 整理（ごみ箱への移動）中は調査を始めない
-        summary.update(cancelled=True, error="ごみ箱へ移動している間は調査できません。終わってからもう一度調べてください")
+    token = db.begin_activity("scan")  # 「実行中か確かめる」と「調査中にする」を1度に行う
+    if token is None:
+        if db.organize_active:  # 整理（ごみ箱への移動）中は調査を始めない
+            summary.update(cancelled=True, error="ごみ箱へ移動している間は調査できません。終わってからもう一度調べてください")
+        else:
+            summary.update(cancelled=True, error="ほかの調査中のため、新しい調査は始めませんでした")
+        if own:
+            db.close()
         return summary
-    db.scan_active = True
     try:
         locations, not_scanned = build_locations(db)
         db.set_json_list("not_scanned_drives", [f"{d['root']}（{DRIVE_KIND_LABEL[d['kind']]}）"
@@ -619,7 +624,7 @@ def task_autoscan(data, tools: media.FFmpegTools, ctl: Controller, report) -> di
         summary["scan_files"] = totals["files"]
         return summary
     finally:
-        db.scan_active = False
+        db.end_activity(token)  # 自分が取った権利だけを返す（例外・中断でも必ず返す）
         if own:
             db.close()
         else:

@@ -307,14 +307,16 @@ class FFmpegDetectionTest(unittest.TestCase):
             (folder / media._exe("ffprobe")).write_bytes(b"")
 
     def test_winget_packages_are_found_without_installing(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # Windows の動作を確かめるため、テスト用のファイルを作る前から Windows として扱う
+        # （Linux などで実行しても ffmpeg.exe / ffprobe.exe の名前で作られるようにする）
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(media.sys, "platform", "win32"):
             bin_dir = Path(tmp) / "Microsoft" / "WinGet" / "Packages" / "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe" \
                 / "ffmpeg-7.1-full_build" / "bin"
             self.make_pair(bin_dir)
+            self.assertTrue((bin_dir / "ffmpeg.exe").is_file())
             dirs = media.winget_ffmpeg_dirs(tmp)
             self.assertIn(str(bin_dir), dirs)
             with mock.patch.object(media.shutil, "which", return_value=None), \
-                    mock.patch.object(media.sys, "platform", "win32"), \
                     mock.patch.dict(os.environ, {"LOCALAPPDATA": tmp}), \
                     mock.patch.object(media.subprocess, "Popen", side_effect=AssertionError("実行しない")):
                 tools = media.find_ffmpeg()

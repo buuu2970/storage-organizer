@@ -283,6 +283,9 @@ class Store:
         self.generation = 0
         self.scan_active = False
         self.organize_active = False
+        # 調査・整理を始める権利の取り合いだけを守るロック（短時間しか持たない。処理の間は持ち続けない）
+        self._activity_lock = threading.Lock()
+        self._activity_owner: object | None = None
         self._next_id = 1
         self._analysis_path = self.data_dir / "analysis.jsonl"
         self._load()
@@ -695,6 +698,37 @@ class Store:
         except FileNotFoundError:
             pass
         return out
+
+    # --- 調査・整理の排他 -----------------------------------------------------------
+    def begin_activity(self, kind: str) -> object | None:
+        """調査（"scan"）または整理（"organize"）を始める権利を取る。取れたら札（token）を返す。
+
+        どちらかが実行中なら取らずに None を返す（待たない）。「実行中か確かめる」と「実行中にする」を
+        1つのロックの中で行うので、2つのスレッドが同時に始めても、始められるのは1つだけ。
+        """
+        if kind not in ("scan", "organize"):
+            raise ValueError(kind)
+        with self._activity_lock:
+            if self.scan_active or self.organize_active:
+                return None
+            token = object()
+            self._activity_owner = token
+            if kind == "scan":
+                self.scan_active = True
+            else:
+                self.organize_active = True
+            return token
+
+    def end_activity(self, token: object | None) -> None:
+        """begin_activity で取った権利を返す。札が今の持ち主でなければ何もしない（他の処理の実行中を解除しない）。"""
+        if token is None:
+            return
+        with self._activity_lock:
+            if self._activity_owner is not token:
+                return
+            self._activity_owner = None
+            self.scan_active = False
+            self.organize_active = False
 
     # --- 調査の状態 ---------------------------------------------------------------
     def locations(self) -> list[dict]:
