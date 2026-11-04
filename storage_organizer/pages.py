@@ -8,17 +8,17 @@ from __future__ import annotations
 import os
 from functools import partial
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, QThread, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGridLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea, QSlider,
+    QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea,
     QSpinBox, QSplitter, QTableView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import ai, media
-from .db import CURATION_CHOICES, Database, loads
+from .legacy_db import CURATION_CHOICES, Database, loads
 from .formatting import format_bytes_exact, format_datetime, format_size
 from .scan_worker import TaskWorker
 
@@ -232,77 +232,7 @@ class GenreChecklist(QWidget):
             box.setChecked(gid in ids)
 
 
-class VideoPlayer(QWidget):
-    """Qt Multimedia による再生・停止・シーク。"""
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.error_label = QLabel()
-        self.error_label.setStyleSheet("color: #b00020;")
-        self.error_label.setWordWrap(True)
-        try:
-            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-            from PySide6.QtMultimediaWidgets import QVideoWidget
-        except ImportError as e:  # Qt Multimedia が使えない環境でも他の機能は動かす
-            self.player = None
-            self.error_label.setText(f"動画プレビューを利用できません: {e}")
-            layout.addWidget(self.error_label)
-            return
-        self.player = QMediaPlayer(self)
-        self.audio = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio)
-        self.video = QVideoWidget()
-        self.video.setMinimumSize(320, 180)
-        self.player.setVideoOutput(self.video)
-        self.play_button = QPushButton("再生")
-        self.stop_button = QPushButton("停止")
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.time_label = QLabel("0:00 / 0:00")
-        controls = QHBoxLayout()
-        for w in (self.play_button, self.stop_button, self.slider, self.time_label):
-            controls.addWidget(w)
-        layout.addWidget(self.video, 1)
-        layout.addLayout(controls)
-        layout.addWidget(self.error_label)
-        self.play_button.clicked.connect(self.toggle)
-        self.stop_button.clicked.connect(self.player.stop)
-        self.slider.sliderMoved.connect(self.player.setPosition)
-        self.player.positionChanged.connect(self._on_position)
-        self.player.durationChanged.connect(lambda d: self.slider.setRange(0, d))
-        self.player.playbackStateChanged.connect(self._on_state)
-        self.player.errorOccurred.connect(self._on_error)
-
-    def set_source(self, path: str | None) -> None:
-        if self.player is None:
-            return
-        self.player.stop()
-        self.error_label.clear()
-        self.player.setSource(QUrl.fromLocalFile(path) if path else QUrl())
-
-    def toggle(self) -> None:
-        if self.player.playbackState() == self.player.PlaybackState.PlayingState:
-            self.player.pause()
-        else:
-            self.player.play()
-
-    def stop(self) -> None:
-        if self.player is not None:
-            self.player.stop()
-
-    def _on_position(self, pos: int) -> None:
-        if not self.slider.isSliderDown():
-            self.slider.setValue(pos)
-        fmt = lambda ms: f"{ms // 60000}:{ms // 1000 % 60:02d}"  # noqa: E731
-        self.time_label.setText(f"{fmt(pos)} / {fmt(self.player.duration())}")
-
-    def _on_state(self, state) -> None:
-        playing = state == self.player.PlaybackState.PlayingState
-        self.play_button.setText("一時停止" if playing else "再生")
-
-    def _on_error(self, error, message: str = "") -> None:
-        self.error_label.setText(f"再生できません（非対応の形式か、ファイルを読み込めません）: {message}")
+from .player import VideoPlayer  # noqa: E402,F401  互換のため
 
 
 # =============================================================================

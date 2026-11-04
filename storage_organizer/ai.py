@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from . import media
-from .db import (CLASSIFY_SCOPE, CURATE_ALL_SCOPE, TRAINABLE_CHOICES, Database, curate_genre_scope,
+from .legacy_db import (CLASSIFY_SCOPE, CURATE_ALL_SCOPE, TRAINABLE_CHOICES, Database, curate_genre_scope,
                  loads)
 
 FEATURE_NAMES = [

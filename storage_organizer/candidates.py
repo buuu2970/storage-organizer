@@ -11,7 +11,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 from . import media
-from .db import Database, loads
+from . import similar
+from .store import Store as Database, loads
 
 LARGE_BYTES = 100 * 1024 * 1024  # 大容量として優先表示する目安
 SHORT_VIDEO_SEC = 3.0
@@ -222,7 +223,7 @@ def group_similar_images(db: Database) -> int:
     groups = defaultdict(list)
     for i in range(n):
         groups[find(i)].append(rows[i])
-    db.conn.execute("UPDATE videos SET similar_group=NULL")
+    mapping: dict[int, list[int]] = {}
     gid = 0
     for members in groups.values():
         if len(members) < 2:
@@ -231,9 +232,51 @@ def group_similar_images(db: Database) -> int:
         if len(hashes) == 1 and None not in hashes:
             continue  # すべて完全一致 → 「重複」で扱う
         gid += 1
-        db.conn.executemany("UPDATE videos SET similar_group=? WHERE id=?", [(gid, m["id"]) for m in members])
-    db.conn.commit()
+        mapping[gid] = [m["id"] for m in members]
+    db.set_similar_groups(mapping)
     return gid
+
+
+def find_similar_videos(db: Database, tools: media.FFmpegTools, ctl, report) -> bool:
+    """長さがほぼ同じ録画がある動画だけ、代表場面を取り出して比べる（段階的な解析）。
+
+    代表場面はファイルが変わるまで再利用する。全ファイルの内容は読み込まない。
+    """
+    if not tools.available:
+        return True
+    rows = [r for r in db.media() if r["kind"] == "video" and not r["cloud_only"]
+            and (loads(r["meta"], {}) or {}).get("duration")
+            and not any(f["kind"] in ("corrupt", "read_error") for f in failures(r))]
+    rows.sort(key=lambda r: loads(r["meta"])["duration"])
+    durations = [loads(r["meta"])["duration"] for r in rows]
+    need = set()
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            if not similar.duration_close(durations[i], durations[j]):
+                break
+            need.update((i, j))
+    todo = [rows[i] for i in sorted(need) if (loads(rows[i]["vsig"], {}) or {}).get("v") != similar.VERSION]
+    for n, row in enumerate(todo):
+        if not ctl.checkpoint(report, "類似録画の確認"):
+            return False
+        report({"phase": "similar", "text": f"似た録画を確認中 {n + 1}/{len(todo)}: {row['name']}",
+                "done": n, "total": len(todo)})
+        try:
+            before = media.file_state(row["path"])
+            sig = similar.signature(tools, row["path"], loads(row["meta"])["duration"], ctl.cancel_event)
+            media.ensure_unchanged(row["path"], before)
+            db.update_video(row["id"], vsig=sig)
+        except media.Cancelled:
+            return False
+        except (OSError, RuntimeError, TimeoutError, media.FileChanged):
+            continue
+    sigs = {rows[i]["id"]: loads(rows[i]["vsig"]) for i in sorted(need) if loads(rows[i]["vsig"], {})}
+    groups, _ = similar.group(sigs)
+    # すべて完全一致のグループは「重複」で扱う
+    groups = [g for g in groups if len({db.video(i)["sha256"] for i in g} - {None}) != 1
+              or any(db.video(i)["sha256"] is None for i in g)]
+    db.set_video_groups(groups)
+    return True
 
 
 def run_analysis(db: Database, tools: media.FFmpegTools, ctl, report) -> bool:
@@ -250,6 +293,8 @@ def run_analysis(db: Database, tools: media.FFmpegTools, ctl, report) -> bool:
         except media.Cancelled:
             return False
     if not find_exact_duplicates(db, ctl, report):
+        return False
+    if not find_similar_videos(db, tools, ctl, report):
         return False
     report({"phase": "similar", "text": "似た画像をまとめています…"})
     group_similar_images(db)
@@ -331,6 +376,25 @@ class Context:
         self.dup_of = {i: h for h, ids in self.dup_groups.items() for i in ids}
         self.sim_of = {i: g for g, ids in self.sim_groups.items() for i in ids}
         self.dup_keep = {h: keep_for_duplicates([self.rows[i] for i in ids]) for h, ids in self.dup_groups.items()}
+        # 類似録画（解像度違い・再圧縮など）。比較が必要な候補で、同じ内容とは保証しない
+        vg = db.video_groups() if hasattr(db, "video_groups") else []
+        # 完全重複のコピーは「重複」グループだけで扱い、類似グループでは残す1本にまとめる（二重計上しない）
+        dup_keep_ids = {h: k for h, (k, _) in self.dup_keep.items()}
+
+        def collapse(grp):
+            out = []
+            for i in grp:
+                if i not in self.rows or i in self.aliases:
+                    continue
+                h = self.dup_of.get(i)
+                rep = dup_keep_ids[h] if h else i
+                if rep not in out:
+                    out.append(rep)
+            return out
+        self.video_groups = [g for g in (collapse(grp) for grp in vg) if len(g) > 1]
+        self.vgroup_of = {i: n for n, g in enumerate(self.video_groups) for i in g}
+        self.vgroup_keep = {n: keep_for_similar_videos([self.rows[i] for i in g])
+                            for n, g in enumerate(self.video_groups)}
         self.sim_keep = {g: keep_for_similar([self.rows[i] for i in ids]) for g, ids in self.sim_groups.items()}
 
     def is_large(self, row) -> bool:
@@ -364,6 +428,17 @@ class Context:
             else:
                 out.append(f"類似画像: 似た画像が他に {len(others)} 枚あります（{detail}）。"
                            "比較して残す画像を選んでください")
+        n = self.vgroup_of.get(row["id"])
+        if n is not None:
+            others = len(self.video_groups[n]) - 1
+            keep_id, why = self.vgroup_keep[n]
+            text = (f"類似録画: 長さがほぼ同じで、代表場面の大半が一致する録画が他に {others} 本あります"
+                    "（同じ内容とは限りません。比較して確認してください）")
+            if keep_id == row["id"]:
+                text += f"。この録画を残すおすすめです（{why}）"
+            elif keep_id is None:
+                text += f"。{why}"
+            out.append(text)
         for f in failures(row):
             out.append(f"{FAILURE_LABEL[f['kind']]}: {f['reason']}")
         if self.is_large(row):
@@ -393,6 +468,38 @@ def keep_for_duplicates(rows) -> tuple[int, str]:
         return protected[0]["id"], "「絶対に残す」が付いています"
     best = min(rows, key=lambda r: (r["mtime"], len(r["path"])))
     return best["id"], "最も古くから保存されているファイルです"
+
+
+def keep_for_similar_videos(rows) -> tuple[int | None, str]:
+    """類似録画の「残すおすすめ」。明確な優劣がなければ決めない（None）。
+
+    解像度だけで高画質とは断定しない。保護したものがあれば、それを残す。
+    """
+    protected = [r for r in rows if r["protected"]]
+    if protected:
+        return protected[0]["id"], "保護されています"
+    kept = [r for r in rows if r["decision"] == "残す"]
+    if len(kept) == 1:
+        return kept[0]["id"], "「残す」を選んだ録画です"
+    best = max(rows, key=pixels)
+    others = [r for r in rows if r is not best]
+    durs = [duration(r) or 0 for r in rows]
+    if pixels(best) and all(pixels(best) >= 1.5 * max(pixels(r), 1) for r in others) \
+            and (duration(best) or 0) >= max(durs) - 1.5:
+        meta = loads(best["meta"], {}) or {}
+        return best["id"], (f"解像度が最も高い（{meta.get('width')}×{meta.get('height')}）。"
+                            "画質の良し悪しは比較して確認してください")
+    return None, "明確な優劣は判断できません。比較して残す1本を選んでください"
+
+
+def similar_keep_confirmed(ctx: "Context", group_index: int) -> int | None:
+    """利用者が比較して残す1本を確定したか（保護、または「残す」を1本選んだ）。確定した ID を返す。"""
+    rows = [ctx.rows[i] for i in ctx.video_groups[group_index]]
+    protected = [r for r in rows if r["protected"]]
+    if protected:
+        return protected[0]["id"]
+    kept = [r for r in rows if r["decision"] == "残す"]
+    return kept[0]["id"] if kept else None
 
 
 def keep_for_similar(rows) -> tuple[int, str]:
@@ -522,6 +629,14 @@ def drive_of(path: str) -> str:
     return p
 
 
+def media_drives(ctx: Context, extra_paths=()) -> list[str]:
+    """録画がある（または調査した場所がある）ドライブの一覧。"""
+    seen: dict[str, None] = {}
+    for p in list(extra_paths) + [r["path"] for r in ctx.rows.values() if r["kind"] == "video"]:
+        seen.setdefault(drive_of(p), None)
+    return list(seen)
+
+
 def drive_space(paths) -> list[dict]:
     """調査した場所があるドライブごとの実際の空き容量。"""
     import shutil
@@ -561,8 +676,24 @@ def _fmt(n: int) -> str:
     return format_size(n)
 
 
-def plan_recordings(ctx: Context, target_bytes: int, include_images: bool = False,
-                    now_ts: float | None = None) -> dict:
+class _LazyExists:
+    """必要になったファイルだけ存在を確認して覚えておく。"""
+
+    def __init__(self, rows: dict) -> None:
+        self.rows = rows
+        self.cache: dict[int, bool] = {}
+
+    def __getitem__(self, media_id: int) -> bool:
+        if media_id not in self.cache:
+            self.cache[media_id] = os.path.exists(self.rows[media_id]["path"])
+        return self.cache[media_id]
+
+    def missing(self, aliases) -> int:
+        return sum(1 for i, ok in self.cache.items() if not ok and i not in aliases)
+
+
+def plan_recordings(ctx: Context, target_bytes: int | None, include_images: bool = False,
+                    now_ts: float | None = None, drive: str | None = None) -> dict:
     """目標容量に合わせて録画の整理候補を提案する（ルールによる提案）。
 
     戻り値:
@@ -572,11 +703,20 @@ def plan_recordings(ctx: Context, target_bytes: int, include_images: bool = Fals
     """
     import time as _time
     now_ts = now_ts or _time.time()
+    no_target = target_bytes is None  # 目標なし: 重複と類似録画のおすすめをすべて出す（要確認の追加はしない）
+    if no_target:
+        target_bytes = float("inf")
     kinds = {"video", "image"} if include_images else {"video"}
-    rows = {i: r for i, r in ctx.rows.items() if r["kind"] in kinds}
+    all_rows = {i: r for i, r in ctx.rows.items() if r["kind"] in kinds}
+    # 空けたいドライブにあるファイルだけを候補にする（別ドライブの整理では目的のドライブは空かない）
+    on_drive = {i for i, r in all_rows.items() if drive is None or drive_of(r["path"]) == drive}
+    rows = {i: all_rows[i] for i in on_drive}
     excluded = {"保護": 0, "残す": 0, "オンライン専用": 0}
 
     def usable(r) -> bool:
+        if r["decision"] == "保留":
+            excluded["保留"] = excluded.get("保留", 0) + 1
+            return False
         if r["id"] in ctx.aliases:  # 同じ実体の別表記は、提案の対象にも数にも入れない
             return False
         if r["protected"]:
@@ -590,19 +730,32 @@ def plan_recordings(ctx: Context, target_bytes: int, include_images: bool = Fals
             return False
         return True
 
+    # スキャン後に消えた・移動したファイルは候補にしない（「残す1本」も実在するものから選ぶ）
+    # 存在の確認は、候補になり得るファイルだけに行う（全ファイルを毎回確認すると、大量の録画で画面が固まる）
+    exists = _LazyExists(all_rows)
     usable_ids = {i for i, r in rows.items() if usable(r)}
     keep_ids = set()
     dup_items = []
     for h, members in ctx.dup_groups.items():
-        members = [m for m in members if m in rows]
-        if len(members) < 2:
-            continue
-        keep_id, why = ctx.dup_keep[h]
-        if keep_id not in members:
-            keep_id = members[0]
+        # 「残す1本」は全ドライブの実在するコピーから選ぶ。ほかのドライブにコピーがあれば、そちらを残す
+        alive = [m for m in members if m in all_rows and exists[m]]
+        if len(alive) < 2 or not any(m in rows for m in alive):
+            continue  # 実在するコピーが1本以下なら、重複分はない
+        protected = [m for m in alive if all_rows[m]["protected"]]
+        elsewhere = [m for m in alive if m not in on_drive]
+        if protected:
+            keep_id, why = protected[0], "保護されています"
+        elif elsewhere:
+            keep_id = min(elsewhere, key=lambda m: (all_rows[m]["mtime"], len(all_rows[m]["path"])))
+            why = f"別のドライブ（{drive_of(all_rows[keep_id]['path'])}）にあるコピーを残します"
+        else:
+            keep_id, why = keep_for_duplicates([all_rows[m] for m in alive])
+        members = [m for m in alive if m in rows] + ([keep_id] if keep_id not in rows else [])
         keep_ids.add(keep_id)
         keep_name = ctx.rows[keep_id]["name"]
         for m in members:
+            if m not in rows:
+                continue
             if m == keep_id or m not in usable_ids:
                 continue
             r = rows[m]
@@ -622,12 +775,40 @@ def plan_recordings(ctx: Context, target_bytes: int, include_images: bool = Fals
         if total - it["size"] >= target_bytes:
             chosen.remove(it)
             total -= it["size"]
+    # 類似録画（比較が必要）。比較して残す1本を確定するまで、ごみ箱へ移す対象にはできない
+    similar_items = []
+    for n, members in enumerate(ctx.video_groups):
+        alive = [m for m in members if m in all_rows and exists[m]]
+        if len(alive) < 2 or not any(m in rows for m in alive):
+            continue
+        confirmed = similar_keep_confirmed(ctx, n)
+        keep_id, why = (confirmed, "比較して残す1本に選んだ録画") if confirmed else ctx.vgroup_keep[n]
+        if keep_id is None or keep_id not in alive:  # おすすめがなければ、いちばん大きい1本を仮に残す
+            keep_id = max(alive, key=lambda m: (pixels(all_rows[m]), all_rows[m]["size"]))
+            why = "明確な優劣は判断できません。比較して残す1本を選んでください"
+        keep_ids.add(keep_id)
+        for m in alive:
+            if m == keep_id or m not in rows or m not in usable_ids or m in {it["id"] for it in dup_items}:
+                continue
+            similar_items.append({
+                "id": m, "kind": "similar", "label": "類似（要比較）", "size": rows[m]["size"], "keep_id": keep_id,
+                "group": n, "confirmed": confirmed is not None,
+                "reasons": [f"「{all_rows[keep_id]['name']}」と長さがほぼ同じで、代表場面の大半が一致します"
+                            f"（同じ内容とは限りません）。{why}"
+                            + ("" if confirmed else "。比較して残す1本を確定すると、選べるようになります")]})
+    similar_items.sort(key=lambda it: -it["size"])
+    for it in similar_items:
+        if total >= target_bytes:
+            break
+        chosen.append(it)
+        total += it["size"]
+    in_groups = set(ctx.vgroup_of) | set(ctx.dup_of)
     review_pool = []
-    if total < target_bytes:
+    if total < target_bytes and not no_target:
         # 重複だけで届かない場合だけ、根拠のある「要確認」候補を追加する（残す1本は対象外）
-        for i in usable_ids - keep_ids - {it["id"] for it in dup_items}:
+        for i in usable_ids - keep_ids - {it["id"] for it in dup_items} - in_groups:
             reasons = _review_reasons(rows[i], now_ts)
-            if reasons:
+            if reasons and exists[i]:
                 review_pool.append({"id": i, "kind": "review", "label": "要確認", "size": rows[i]["size"],
                                     "keep_id": None, "reasons": reasons, "failure": bool(failures(rows[i]))})
         review_pool.sort(key=lambda it: (not it["failure"], -it["size"]))
@@ -637,7 +818,21 @@ def plan_recordings(ctx: Context, target_bytes: int, include_images: bool = Fals
             chosen.append(it)
             total += it["size"]
     dup_total = sum(it["size"] for it in chosen if it["kind"] == "duplicate")
-    return {"items": chosen, "total": total, "target": target_bytes, "shortage": max(target_bytes - total, 0),
-            "achieved": total >= target_bytes, "duplicate_total": dup_total, "review_total": total - dup_total,
+    similar_total = sum(it["size"] for it in chosen if it["kind"] == "similar")
+    missing = exists.missing(ctx.aliases)
+    if missing:
+        excluded["見つからない"] = missing
+    # 重複の確認（ハッシュ計算）がまだの録画: サイズが同じ録画がほかにあるのに SHA-256 がないもの
+    sizes: dict[int, int] = defaultdict(int)
+    for r in rows.values():
+        if not r["cloud_only"] and r["size"] > 0:
+            sizes[r["size"]] += 1
+    unchecked = sum(1 for r in rows.values() if not r["cloud_only"] and r["size"] > 0
+                    and sizes[r["size"]] > 1 and not r["sha256"])
+    return {"drive": drive, "unchecked": unchecked, "items": chosen, "total": total,
+            "target": None if no_target else target_bytes,
+            "shortage": 0 if no_target else max(target_bytes - total, 0),
+            "achieved": None if no_target else total >= target_bytes, "duplicate_total": dup_total, "similar_total": similar_total,
+            "review_total": total - dup_total - similar_total,
             "duplicate_pool": sum(it["size"] for it in dup_items), "review_pool": len(review_pool),
             "excluded": excluded}

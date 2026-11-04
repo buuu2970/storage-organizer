@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import candidates, media
-from .db import Database
+from .store import Store
 from .file_types import categorize
 from .scanner import is_cloud_only, is_link
 
@@ -49,7 +49,15 @@ ANYWHERE_EXCLUDES = {
 APP_FILE_EXTS = {".exe", ".dll", ".sys", ".msi"}
 SMALL_IMAGE_BYTES = 10 * 1024  # ドライブ全体の調査で、これ未満の画像はアプリの部品として除外する
 
+# 開発用のプロジェクトフォルダの目印（ソースコードの .ts などを録画と取り違えないため、丸ごと除外する）
+PROJECT_MARKERS = {".git", "package.json", "tsconfig.json", "pyproject.toml", "cargo.toml", "go.mod",
+                   "pom.xml", "build.gradle", "composer.json", "gemfile", ".hg", ".svn"}
+# 拡張子だけでは録画と決められないもの（.ts は TypeScript のソースコードにも使われる）
+AMBIGUOUS_VIDEO_EXTS = {".ts"}
+
 EXCLUSION_RULES = [
+    "開発用のプロジェクトフォルダ（.git・package.json・tsconfig.json などがあるフォルダ）",
+    "拡張子が .ts でも、中身が録画（MPEG-TS 形式）でないファイル（TypeScript のソースコードなど）",
     "Windows・Program Files・ProgramData など、Windows やアプリの動作に使われる領域",
     "AppData・キャッシュ・一時フォルダ・開発用フォルダ（node_modules など）・ごみ箱",
     "隠しフォルダ・システム属性のフォルダ",
@@ -200,7 +208,7 @@ DRIVE_KIND_LABEL = {"internal": "内蔵ドライブ", "external": "外付けド�
                     "removable": "リムーバブルドライブ", "unknown": "種類を判別できないドライブ"}
 
 
-def build_locations(db: Database, include_disabled: bool = False) -> tuple[list[Location], list[dict]]:
+def build_locations(db: Store, include_disabled: bool = False) -> tuple[list[Location], list[dict]]:
     """調査する場所（優先順）と、自動では調べないドライブの一覧。
 
     「調べる場所を選ぶ」でチェックを外した場所は、include_disabled=True のときだけ含める。
@@ -230,7 +238,7 @@ def build_locations(db: Database, include_disabled: bool = False) -> tuple[list[
 
 # --- 除外判定 ------------------------------------------------------------------
 class Exclusions:
-    def __init__(self, db: Database, skip_roots: list[str]) -> None:
+    def __init__(self, db: Store, skip_roots: list[str]) -> None:
         self.user = [norm(p) for p in db.json_list("excluded_folders")]
         self.skip_roots = {norm(p) for p in skip_roots}  # 別の調査場所として調べる場所
         self.fixed = {norm(str(db.data_dir))}
@@ -290,42 +298,151 @@ class Controller:
         return not self.cancel_event.is_set()
 
 
-def scan_location(db: Database, loc: Location, skip_roots: list[str], gen: int, ctl: Controller,
+def is_mpeg_ts(path: str) -> bool:
+    """先頭の2パケット（188バイトごと）の同期バイトを確かめる。読み取るのは先頭 189 バイトだけ。"""
+    try:
+        with open(path, "rb") as f:  # 読み取り専用
+            head = f.read(189)
+    except OSError:
+        return False
+    return len(head) == 189 and head[0] == 0x47 and head[188] == 0x47
+
+
+def is_project_folder(names: set[str]) -> bool:
+    return bool({n.lower() for n in names} & PROJECT_MARKERS)
+
+
+def purge_non_media(db: Store) -> int:
+    """以前の版で録画として登録された .ts のソースコードなどを、一覧から外す（保護・判断の記録は残す）。"""
+    count = 0
+    touched = set()
+    for row in db.media():
+        if row["ext"] in AMBIGUOUS_VIDEO_EXTS and (row["cloud_only"] or not os.path.exists(row["path"])
+                                                   or not is_mpeg_ts(row["path"])):
+            db.hide(row["id"])
+            touched.add(row["location"])
+            count += 1
+    gen = int(db.get_setting("scan_gen", "0"))
+    for loc in touched - {None}:  # 外した結果を保存する（再起動しても戻らないように）
+        db.save_inventory(loc, gen)
+    return count
+
+
+# 容量の集計で、除外した場所を測るかどうか（利用者が対象外にした場所は測らない）
+MEASURE_REASONS = {
+    "Windows やアプリの動作に使われる領域": "システム・アプリ",
+    "アプリの内部素材・キャッシュ・一時ファイルの領域": "システム・アプリ",
+    "アプリのフォルダ（実行ファイルを含む）": "システム・アプリ",
+    "開発用のプロジェクトフォルダ（ソースコードなど）": "開発用フォルダ",
+    "隠しフォルダ": "隠しフォルダ",
+    "隠しフォルダ・システムフォルダ": "隠しフォルダ",
+}
+TOP_FILES = 200
+
+
+def measure(path: str, ctl: Controller) -> tuple[int, int, int]:
+    """フォルダの合計サイズだけを測る（内容は読まない・リンクはたどらない）。(バイト, 件数, 読めなかった数)"""
+    total = count = errors = 0
+    stack = [path]
+    while stack:
+        if ctl.cancel_event.is_set():
+            break
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            errors += 1
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink() or (getattr(e, "is_junction", None) and e.is_junction()):
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    total += e.stat(follow_symlinks=False).st_size
+                    count += 1
+            except OSError:
+                errors += 1
+    return total, count, errors
+
+
+def scan_location(db: Store, loc: Location, skip_roots: list[str], gen: int, ctl: Controller,
                   report, totals: dict, batch_interval: float = 0.5) -> str:
-    """1つの場所を調べて登録する。戻り値は調査状態（完了 / 一部スキップ / 中断）。"""
+    """1つの場所を調べる。全ファイルの容量を集計し、画像・動画は一覧に登録する。
+
+    戻り値は調査状態（完了 / 一部スキップ / 中断）。
+    """
+    import heapq
     excl = Exclusions(db, skip_roots)
     # ドライブ全体を調べるとき（追加した場所がドライブ直下の場合も含む）はアプリ素材の除外を強める
     drive_mode = loc.kind == "drive" or Path(loc.path).parent == Path(loc.path)
-    db.conn.execute("DELETE FROM scan_skips WHERE location=?", (loc.path,))
-    db.conn.execute("UPDATE scan_locations SET status='調査中' WHERE path=?", (loc.path,))
-    db.conn.commit()
+    db.clear_skips(loc.path)
+    db.update_location(loc.path, status="調査中")
     errors = 0
     files = size_total = 0
     batch: list[tuple] = []
     last = time.monotonic()
+    root = os.path.normpath(loc.path)
+    by_category: dict[str, list[int]] = {}
+    by_folder: dict[str, list[int]] = {}
+    top: list[tuple[int, str, str]] = []
+    areas: list[list] = []
+
+    def folder_key(path: str) -> str:
+        rel = os.path.relpath(path, root)
+        first = rel.split(os.sep)[0]
+        return "（この場所の直下）" if first in (".", "") else first
+
+    def account(path: str, size: int, category: str, key: str) -> None:
+        c = by_category.setdefault(category, [0, 0])
+        c[0] += 1
+        c[1] += size
+        f = by_folder.setdefault(key, [0, 0])
+        f[0] += 1
+        f[1] += size
+        if len(top) < TOP_FILES:
+            heapq.heappush(top, (size, path, category))
+        elif size > top[0][0]:
+            heapq.heapreplace(top, (size, path, category))
 
     def skip(path, reason, kind):
-        db.conn.execute("INSERT OR REPLACE INTO scan_skips VALUES (?,?,?,?,?)",
-                        (path, loc.path, reason, kind, time.time()))
+        db.add_skip(path, loc.path, reason, kind)
+        category = MEASURE_REASONS.get(reason) if kind == "excluded" else None
+        if category:  # 容量の原因としては測る（整理候補にはしない）
+            size, count, _ = measure(path, ctl)
+            areas.append([path, size, reason])
+            by_category.setdefault(category, [0, 0])
+            by_category[category][0] += count
+            by_category[category][1] += size
+            k = by_folder.setdefault(folder_key(path), [0, 0])
+            k[0] += count
+            k[1] += size
+
+    def save_stats():
+        db.set_location_stats(loc.path, {
+            "by_category": by_category, "by_folder": by_folder,
+            "top_files": [[sz, p, c] for sz, p, c in sorted(top, reverse=True)],
+            "areas": sorted(areas, key=lambda a: -a[1])[:200], "updated": time.time()})
 
     def flush(current):
         nonlocal batch, last
         if batch:
             db.upsert_media(batch, gen, loc.path)
             batch = []
-        db.conn.commit()
         report({"phase": "scan", "location": loc.label, "current": current, "found": totals["files"],
                 "bytes": totals["bytes"], "refresh": True})
         last = time.monotonic()
 
-    stack = [os.path.normpath(loc.path)]
+    stack = [root]
     visited: set[str] = set()
     while stack:
         current = stack.pop()
         if not ctl.checkpoint(report, current):
             flush(current)
-            db.conn.execute("UPDATE scan_locations SET status='中断' WHERE path=?", (loc.path,))
-            db.conn.commit()
+            save_stats()
+            db.update_location(loc.path, status="中断")
+            db.save_inventory(loc.path, gen)
             return "中断"
         key = norm(current)
         if key in visited:
@@ -337,8 +454,11 @@ def scan_location(db: Database, loc: Location, skip_roots: list[str], gen: int, 
             errors += 1
             skip(current, e.strerror or type(e).__name__, "error")
             continue
-        subdirs, found, app_folder = [], [], False
+        subdirs, found, plain, app_folder = [], [], [], False
         at_drive_root = drive_mode and norm(current) == norm(loc.path)
+        if norm(current) != norm(loc.path) and is_project_folder({e.name for e in entries}):
+            skip(current, "開発用のプロジェクトフォルダ（ソースコードなど）", "excluded")
+            continue
         for entry in entries:
             try:
                 if is_link(entry):
@@ -349,30 +469,41 @@ def scan_location(db: Database, loc: Location, skip_roots: list[str], gen: int, 
                     st = entry.stat(follow_symlinks=False) if sys.platform == "win32" else None
                     reason = excl.directory_reason(entry.path, entry.name, 1 if at_drive_root else 99, st)
                     if reason:
-                        skip(entry.path, reason, "excluded")
+                        subdirs.append(("skip", entry.path, reason))
                     else:
-                        subdirs.append(entry.path)
+                        subdirs.append(("dir", entry.path, None))
                     continue
                 if not entry.is_file(follow_symlinks=False):
                     continue
                 ext = os.path.splitext(entry.name)[1].lower()
                 if drive_mode and ext in APP_FILE_EXTS:
                     app_folder = True
-                kind = KIND_OF_CATEGORY.get(categorize(entry.name))
-                if kind is None:
-                    continue
                 st = entry.stat(follow_symlinks=False)
-                if drive_mode and kind == "image" and st.st_size < SMALL_IMAGE_BYTES:
-                    continue
-                found.append((entry.path, entry.name, current, st.st_size, st.st_mtime, ext, kind,
-                              is_cloud_only(st)))
+                category = categorize(entry.name)
+                kind = KIND_OF_CATEGORY.get(category)
+                if kind and ext in AMBIGUOUS_VIDEO_EXTS and (is_cloud_only(st) or not is_mpeg_ts(entry.path)):
+                    kind, category = None, "その他"  # TypeScript のソースコードなどを録画と取り違えない
+                if kind and drive_mode and kind == "image" and st.st_size < SMALL_IMAGE_BYTES:
+                    kind = None  # アプリの部品の可能性がある小さな画像は一覧に入れない（容量は数える）
+                plain.append((entry.path, st.st_size, category))
+                if kind:
+                    found.append((entry.path, entry.name, current, st.st_size, st.st_mtime, ext, kind,
+                                  is_cloud_only(st)))
             except OSError as e:
                 errors += 1
                 skip(entry.path, e.strerror or type(e).__name__, "error")
+        fk = folder_key(current)
         if app_folder and norm(current) != norm(loc.path):
+            # アプリのフォルダ: フォルダ全体（直下のファイルを含む）の容量を一度だけ測り、一覧には入れない
             skip(current, "アプリのフォルダ（実行ファイルを含む）", "excluded")
             continue
-        stack.extend(reversed(subdirs))
+        for path, size, category in plain:
+            account(path, size, category, fk)
+        for kind_, path, reason in reversed(subdirs):
+            if kind_ == "skip":
+                skip(path, reason, "excluded")
+            else:
+                stack.append(path)
         batch.extend(found)
         for item in found:
             files += 1
@@ -382,43 +513,43 @@ def scan_location(db: Database, loc: Location, skip_roots: list[str], gen: int, 
         if len(batch) >= 500 or time.monotonic() - last >= batch_interval:
             flush(current)
     flush(loc.path)
+    save_stats()
     status = "一部スキップ" if errors else "完了"
-    db.conn.execute("UPDATE scan_locations SET status=?, files=?, bytes=?, last_completed=? WHERE path=?",
-                    (status, files, size_total, time.time(), loc.path))
-    db.conn.commit()
+    db.update_location(loc.path, status=status, files=files, bytes=size_total, last_completed=time.time(),
+                       all_bytes=sum(v[1] for v in by_category.values()))
     if status == "完了":
         db.mark_unseen_missing(loc.path, gen)  # 最後まで調べられた場所だけ
+    # 除外した場所（プロジェクトフォルダなど）にある以前の登録は、調査が一部スキップでも一覧から外す
+    excluded = [x["path"] for x in db.skips("excluded", loc.path)]
+    if excluded:
+        prefixes = tuple(norm(ex).rstrip("\\/") + os.sep for ex in excluded)
+        for row in db.media():
+            if row["seen_gen"] < gen and norm(row["path"]).startswith(prefixes):
+                db.hide(row["id"])
+    db.save_inventory(loc.path, gen)
+    db.save_scan_state()
     return status
 
 
-def task_autoscan(data_dir, tools: media.FFmpegTools, ctl: Controller, report) -> dict:
-    """自動スキャンの一連の流れ（別スレッドで実行）。
+def task_autoscan(data, tools: media.FFmpegTools, ctl: Controller, report) -> dict:
+    """自動スキャンの一連の流れ（別スレッドで実行）。data は Store か、データの保存先フォルダ。
 
-    1. 調査場所を検出して探索・登録 → 2. 新規・変更ファイルの軽い解析
-    → 3. サイズが同じファイルだけハッシュ計算（完全重複） → 4. 類似画像のグループ化
+    1. 調査場所を探索し、全ファイルの容量を集計・画像と動画を登録 → 2. 新規・変更ファイルの軽い解析
+    → 3. サイズが同じファイルだけハッシュ計算（完全重複） → 4. 類似録画・類似画像のグループ化
     """
-    db = Database(data_dir)
+    own = not isinstance(data, Store)
+    db = Store(data) if own else data
     summary = {"cancelled": False, "statuses": {}}
     try:
         locations, not_scanned = build_locations(db)
         db.set_json_list("not_scanned_drives", [f"{d['root']}（{DRIVE_KIND_LABEL[d['kind']]}）"
                                                 for d in not_scanned])
-        keep = {loc.path for loc in locations}
-        for row in db.conn.execute("SELECT path FROM scan_locations").fetchall():
-            if row[0] not in keep:
-                db.conn.execute("DELETE FROM scan_locations WHERE path=?", (row[0],))
-        for loc in locations:
-            db.conn.execute(
-                "INSERT INTO scan_locations(path,kind,label,priority) VALUES (?,?,?,?) "
-                "ON CONFLICT(path) DO UPDATE SET kind=excluded.kind, label=excluded.label, "
-                "priority=excluded.priority, status=CASE WHEN status='調査中' THEN '中断' ELSE status END",
-                (loc.path, loc.kind, loc.label, loc.priority))
-        db.conn.commit()
+        db.set_locations(locations)
         gen = int(db.get_setting("scan_gen", "0")) + 1
         db.set_setting("scan_gen", str(gen))
         db.set_setting("scan_started", str(time.time()))
         totals = {"files": 0, "bytes": 0}
-        for i, loc in enumerate(locations):
+        for loc in locations:
             # 優先度の高い場所（先に調べた場所）と、他の場所の中にある場所は二重に調べない
             others = [o.path for o in locations if o is not loc and is_within(o.path, loc.path)]
             status = scan_location(db, loc, others, gen, ctl, report, totals)
@@ -427,10 +558,14 @@ def task_autoscan(data_dir, tools: media.FFmpegTools, ctl: Controller, report) -
                 summary["cancelled"] = True
                 return summary
         db.set_setting("scan_finished", str(time.time()))
+        purge_non_media(db)
         if not candidates.run_analysis(db, tools, ctl, report):
             summary["cancelled"] = True
             return summary
         summary["scan_files"] = totals["files"]
         return summary
     finally:
-        db.close()
+        if own:
+            db.close()
+        else:
+            db.save_scan_state()

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from . import candidates, media
-from .db import Database
+from .store import Store as Database
 
 
 class TrashError(Exception):
@@ -28,6 +28,11 @@ class TrashResult:
     size: int
     ok: bool
     message: str
+    status: str = ""  # moved（移動した） / skipped（安全確認で止めた） / failed（ごみ箱への移動に失敗）
+
+    def __post_init__(self) -> None:
+        if not self.status:
+            self.status = "moved" if self.ok else "skipped"
 
 
 def _windows_recycle(path: str) -> None:
@@ -84,6 +89,9 @@ def check(db: Database, media_id: int, ctx: candidates.Context | None = None) ->
         return f"ファイルを確認できません（{e.strerror or e}）"
     if size != row["size"] or abs(mtime_ns / 1e9 - row["mtime"]) > 1e-6:
         return "スキャンした後にファイルが変更されています。もう一度確認してください"
+    from .autoscan import AMBIGUOUS_VIDEO_EXTS, is_mpeg_ts
+    if row["ext"] in AMBIGUOUS_VIDEO_EXTS and not is_mpeg_ts(row["path"]):
+        return "録画ではないファイル（ソースコードなど）の可能性があるため移動しません"
     return None
 
 
@@ -121,11 +129,29 @@ def survivors_check(db: Database, ctx: candidates.Context, ids: list[int]) -> se
     return blocked
 
 
+def similar_check(db: Database, ctx: candidates.Context, ids: list[int]) -> set[int]:
+    """類似録画は、移動しない別の1本が「残す」か保護として確定していて、実在・未変更のときだけ移動できる。"""
+    chosen = set(ids)
+    moving = {candidates.file_identity(db.video(m)["path"]) for m in chosen if db.video(m) is not None}
+    blocked = set()
+    for members in ctx.video_groups:
+        selected = [m for m in members if m in chosen]
+        if not selected:
+            continue
+        keepers = [m for m in members if m not in chosen and _intact(db, m)
+                   and (db.video(m)["protected"] or db.video(m)["decision"] == "残す")
+                   and candidates.file_identity(db.video(m)["path"]) not in moving]
+        if not keepers:
+            blocked.update(selected)
+    return blocked
+
+
 def move_to_trash(db: Database, ids: list[int], backend: Callable[[str], None] | None = None) -> list[TrashResult]:
     """確認済みのファイルをごみ箱へ移動する。1件ずつ確認・移動し、結果を返す。"""
     backend = backend or default_backend()
     ctx = candidates.Context(db)
     blocked = survivors_check(db, ctx, ids)
+    similar_blocked = similar_check(db, ctx, ids)
     results = []
     moved_identities: set = set()
     for media_id in ids:
@@ -139,6 +165,11 @@ def move_to_trash(db: Database, ids: list[int], backend: Callable[[str], None] |
             results.append(TrashResult(media_id, row["path"], row["size"], False,
                                        "同じファイルをすでに移動しています"))
             continue
+        if media_id in similar_blocked:
+            results.append(TrashResult(media_id, row["path"], row["size"], False,
+                                       "類似録画は、比較して残す1本を選んでから移動できます"
+                                       "（残す録画が見つからない・変更された場合も移動しません）"))
+            continue
         if media_id in blocked:
             results.append(TrashResult(media_id, row["path"], row["size"], False,
                                        "同じ内容のファイルがほかに残っていないため、このファイルは移動しませんでした"
@@ -151,12 +182,12 @@ def move_to_trash(db: Database, ids: list[int], backend: Callable[[str], None] |
         try:
             backend(row["path"])
         except Exception as e:  # 失敗しても完全削除には切り替えない
-            results.append(TrashResult(media_id, row["path"], row["size"], False, str(e)))
+            results.append(TrashResult(media_id, row["path"], row["size"], False, str(e), "failed"))
             db.log_trash(row["path"], row["size"], "error", str(e))
             continue
         if os.path.exists(row["path"]):
             results.append(TrashResult(media_id, row["path"], row["size"], False,
-                                       "移動を確認できませんでした（ファイルが残っています）"))
+                                       "移動を確認できませんでした（ファイルが残っています）", "failed"))
             db.log_trash(row["path"], row["size"], "error", "移動後もファイルが残っている")
             continue
         moved_identities.add(ident)

@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
 from storage_organizer import ai, media, scanner  # noqa: E402
-from storage_organizer.db import CLASSIFY_SCOPE, CURATE_ALL_SCOPE, Database, curate_genre_scope  # noqa: E402
+from storage_organizer.legacy_db import CLASSIFY_SCOPE, CURATE_ALL_SCOPE, Database, curate_genre_scope  # noqa: E402
 
 FFMPEG = media.find_ffmpeg()
 
