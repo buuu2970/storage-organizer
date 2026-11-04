@@ -431,7 +431,8 @@ class CommonScreenPrefilterTest(unittest.TestCase):
         self.assertLess(stats["detailed_pairs"], stats["window_pairs"] // 4)  # 絞り込みが効いている
 
 
-@unittest.skipUnless(sys.platform == "win32", "Windows のごみ箱が必要（Windows 実機で確認）")
+@unittest.skipUnless(sys.platform == "win32" and os.environ.get("RECSORT_LIVE_RECYCLE_TEST") == "1",
+                     "実際の Windows のごみ箱を使うため、RECSORT_LIVE_RECYCLE_TEST=1 のときだけ実行（通常は tools/recycle_bin_live_test.py で確認）")
 class WindowsRecycleFromThreadTest(unittest.TestCase):  # pragma: no cover
     """Windows で「ごみ箱へ移動」で落ちた報告への対応: 別スレッドから実際のごみ箱へ移せること。
 

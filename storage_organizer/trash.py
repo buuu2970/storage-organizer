@@ -13,12 +13,9 @@ import sys
 from dataclasses import dataclass
 from typing import Callable
 
-from . import candidates, media
+from . import candidates, media, recycle_bin
+from .recycle_bin import TrashError  # noqa: F401  （呼び出し側は trash.TrashError を使う）
 from .store import Store as Database
-
-
-class TrashError(Exception):
-    pass
 
 
 @dataclass
@@ -37,50 +34,12 @@ class TrashResult:
 
 
 def _windows_recycle(path: str) -> None:
-    """Windows のごみ箱へ移動する。完全削除になりそうな場合は Windows の警告で止められる。
+    """Windows のごみ箱へ移動する（実体は recycle_bin.recycle）。
 
-    別スレッドから呼ぶ場合は、そのスレッドで COM を初期化しておくこと（windows_com_thread を使う）。
+    完全削除になりそうな場合は移動せずに TrashError にする。確実にごみ箱へ移せたと確認できない場合もエラー。
+    COM はこの中で初期化・終了するが、別スレッドから呼ぶ場合は windows_com_thread で囲んでおくとよい。
     """
-    import ctypes
-    from ctypes import wintypes
-
-    full = os.path.abspath(path)
-    root = os.path.splitdrive(full)[0] + "\\"
-
-    class SHQUERYRBINFO(ctypes.Structure):
-        _fields_ = [("cbSize", wintypes.DWORD), ("i64Size", ctypes.c_longlong),
-                    ("i64NumItems", ctypes.c_longlong)]
-
-    class SHFILEOPSTRUCTW(ctypes.Structure):
-        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", ctypes.c_void_p),
-                    ("pTo", ctypes.c_void_p), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
-                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
-
-    shell32 = ctypes.windll.shell32
-    shell32.SHQueryRecycleBinW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SHQUERYRBINFO)]
-    shell32.SHQueryRecycleBinW.restype = ctypes.c_long
-    shell32.SHFileOperationW.argtypes = [ctypes.POINTER(SHFILEOPSTRUCTW)]
-    shell32.SHFileOperationW.restype = ctypes.c_int
-
-    info = SHQUERYRBINFO(ctypes.sizeof(SHQUERYRBINFO), 0, 0)
-    if shell32.SHQueryRecycleBinW(root, ctypes.byref(info)) != 0:
-        raise TrashError(f"{root} にはごみ箱がないため移動できません（完全削除は行いません）")
-    # pFrom は二重の NUL で終わる文字列。呼び出しが終わるまで buffer を保持する
-    buffer = ctypes.create_unicode_buffer(full + "\0")
-    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO = 3, 0x4, 0x10, 0x40
-    FOF_NOERRORUI, FOF_WANTNUKEWARNING = 0x400, 0x4000
-    op = SHFILEOPSTRUCTW()
-    op.hwnd = None
-    op.wFunc = FO_DELETE
-    op.pFrom = ctypes.cast(buffer, ctypes.c_void_p)
-    op.pTo = None
-    # エラーはダイアログを出さず戻り値で受け取る。完全削除になりそうなときの Windows の警告は残す
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING
-    rc = shell32.SHFileOperationW(ctypes.byref(op))
-    if rc != 0:
-        raise TrashError(f"ごみ箱へ移動できませんでした（エラーコード {rc:#x}）")
-    if op.fAnyOperationsAborted:
-        raise TrashError("ごみ箱へ移動できないため中止しました（完全削除は行っていません）")
+    recycle_bin.recycle(path)
 
 
 class windows_com_thread:
@@ -102,12 +61,10 @@ class windows_com_thread:
 
 
 def default_backend() -> Callable[[str], None]:
-    if sys.platform == "win32":
+    """ごみ箱への移動処理。Windows + pywin32 でなければ、常にエラーにする関数を返す（完全削除へは切り替えない）。"""
+    if recycle_bin.available() is None:
         return _windows_recycle
-
-    def unsupported(path: str) -> None:
-        raise TrashError("ごみ箱への移動は Windows でのみ利用できます")
-    return unsupported
+    return recycle_bin.backend()
 
 
 def check(db: Database, media_id: int, ctx: candidates.Context | None = None) -> str | None:
