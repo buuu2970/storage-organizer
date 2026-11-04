@@ -117,8 +117,10 @@ class InstanceLockTest(unittest.TestCase):
                         "from PySide6.QtWidgets import QMessageBox; "
                         "QMessageBox.warning = staticmethod(lambda *a, **k: print('ALREADY', a[2][:20])); "
                         "sys.exit(app.main())" % str(ROOT))
-                env = dict(os.environ, QT_QPA_PLATFORM="offscreen", RECSORT_DATA_DIR=t)
-                out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+                env = dict(os.environ, QT_QPA_PLATFORM="offscreen", RECSORT_DATA_DIR=t, PYTHONIOENCODING="utf-8")
+                # 子プロセスは日本語を出力する。Windows の既定の文字コード（cp932）では読めないため UTF-8 で読む
+                out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                                     encoding="utf-8", errors="replace", timeout=60)
             finally:
                 p.kill()
                 p.wait()
@@ -261,6 +263,7 @@ class TrashThreadTest(unittest.TestCase):
                                                     ".mp4"))
         self.state = organizer.MediaState(self.store, lambda: FFMPEG)
         self.page = organizer.FinalPage(self.state)
+        self.page.confirm = lambda count, total: True  # 移動前の確認ダイアログで「はい」を選んだものとする
         self.results = []
         self.page.finished.connect(self.results.append)
         self.page.prepare(self.files)

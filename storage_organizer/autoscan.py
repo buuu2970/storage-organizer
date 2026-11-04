@@ -1,7 +1,8 @@
 """自動スキャン（担当: スキャン処理）。
 
-PC 内の画像・動画を、ユーザーがフォルダを選ばなくても探す。
-- ピクチャ・ビデオ・ダウンロード・デスクトップ・ドキュメントを先に調べ、その後に内蔵ドライブを調べる
+PC 内の録画（動画ファイル）を、ユーザーがフォルダを選ばなくても探す。
+- 一覧に登録するのは録画（動画）だけ。画像などほかのファイルは、容量の集計にだけ数える
+- ピクチャ・ビデオ・ダウンロード・デスクトップ・ドキュメントを先に調べ、その後に内蔵ドライブ全体を調べる
 - ユーザーフォルダの実際の保存先（OneDrive などへの移動を含む）は Windows から取得する
 - 外付け・ネットワークドライブは自動では調べない（設定で追加できる）
 - システム領域・アプリの素材やキャッシュは除外する
@@ -23,7 +24,8 @@ from .store import Store
 from .file_types import categorize
 from .scanner import is_cloud_only, is_link
 
-KIND_OF_CATEGORY = {"画像": "image", "動画": "video"}
+# 一覧に登録する種類（今の版は録画の整理に特化する。画像の整理は将来ここに "画像": "image" を足す）
+KIND_OF_CATEGORY = {"動画": "video"}
 
 # ユーザーフォルダ（Windows の既知フォルダ ID）。この順番で優先して調べる
 KNOWN_FOLDERS = [
@@ -32,6 +34,17 @@ KNOWN_FOLDERS = [
     ("ダウンロード", "{374DE290-123F-4565-9164-39C4925E467B}", "Downloads"),
     ("デスクトップ", "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}", "Desktop"),
     ("ドキュメント", "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}", "Documents"),
+]
+
+# 調査しない Windows・アプリの領域（既知フォルダ ID で実際の場所を取得する。固定のパスだけに頼らない）
+SYSTEM_KNOWN_FOLDERS = [
+    "{F38BF404-1D43-42F2-9305-67DE0B28FC23}",  # Windows
+    "{905E63B6-C1BF-494E-B29C-65B732D3D21A}",  # Program Files
+    "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}",  # Program Files (x86)
+    "{62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}",  # ProgramData
+    "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}",  # AppData\Local
+    "{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}",  # AppData\Roaming
+    "{A520A1A4-1780-4FF6-BD18-167343C5AF16}",  # AppData\LocalLow
 ]
 
 # ドライブ直下にある場合に除外するフォルダ（Windows・アプリの動作に使われる領域）
@@ -128,6 +141,23 @@ def _known_folder_path(guid: str) -> str | None:
         return ptr.value
     finally:
         ctypes.windll.ole32.CoTaskMemFree(ptr)
+
+
+def system_folders() -> set[str]:
+    """Windows・アプリの領域（正規化したパス）。既知フォルダ API で取得し、取れなければ環境変数で補う。"""
+    found = set()
+    if sys.platform == "win32":
+        for guid in SYSTEM_KNOWN_FOLDERS:
+            try:
+                path = _known_folder_path(guid)
+            except Exception:
+                path = None
+            if path:
+                found.add(norm(path))
+    for var in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData", "LOCALAPPDATA", "APPDATA"):
+        if os.environ.get(var):
+            found.add(norm(os.environ[var]))
+    return found
 
 
 def known_folders() -> list[tuple[str, str]]:
@@ -257,10 +287,7 @@ class Exclusions:
     def __init__(self, db: Store, skip_roots: list[str]) -> None:
         self.user = [norm(p) for p in db.json_list("excluded_folders")]
         self.skip_roots = {norm(p) for p in skip_roots}  # 別の調査場所として調べる場所
-        self.fixed = {norm(str(db.data_dir))}
-        for var in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
-            if os.environ.get(var):
-                self.fixed.add(norm(os.environ[var]))
+        self.fixed = {norm(str(db.data_dir))} | system_folders()
 
     def directory_reason(self, path: str, name: str, depth: int, st) -> str | None:
         n = norm(path)
@@ -499,7 +526,7 @@ def scan_location(db: Store, loc: Location, skip_roots: list[str], gen: int, ctl
                 kind = KIND_OF_CATEGORY.get(category)
                 if kind and ext in AMBIGUOUS_VIDEO_EXTS and (is_cloud_only(st) or not is_mpeg_ts(entry.path)):
                     kind, category = None, "その他"  # TypeScript のソースコードなどを録画と取り違えない
-                if kind and drive_mode and kind == "image" and st.st_size < SMALL_IMAGE_BYTES:
+                if kind == "image" and drive_mode and st.st_size < SMALL_IMAGE_BYTES:
                     kind = None  # アプリの部品の可能性がある小さな画像は一覧に入れない（容量は数える）
                 plain.append((entry.path, st.st_size, category))
                 if kind:

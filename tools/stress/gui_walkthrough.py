@@ -106,7 +106,7 @@ def run():
     w.flow.compare.back_button.click()
     p.final_button.click()
     pump()
-    final = w.flow.final
+    final = w.candidates.final
     shot(w, "04_final")
     check("最終確認: 件数が選択と一致", len(final.ids) == len(ids))
     check("最終確認: 残すファイルを分けて表示", final.keep_table.rowCount() >= 1)
@@ -122,7 +122,7 @@ def run():
     while time.time() < end and final.is_running():
         pump(0.05)
     shot(w, "06_result_partial_failure")
-    res = w.flow.result.results
+    res = w.candidates.result.results
     check("結果: 失敗を含む", any(r.status == "failed" for r in res))
     check("結果: 表示と実ファイルが一致", all(os.path.exists(r.path) != (r.status == "moved") for r in res))
     check("結果: 重複の最後の1本が残る", any((root / q).exists() for q in

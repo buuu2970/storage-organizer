@@ -146,7 +146,7 @@ def case_gui(seed: int, work: Path, rec: dict) -> None:
                 w.show_plan(None)
                 if plan.final_button.isEnabled():
                     plan.final_button.click()
-                    final = w.flow.final
+                    final = w.candidates.final
                     fails = {Path(w.store.video(i)["path"]).name for i in final.ids if rng.random() < 0.2}
 
                     def slow(count, path):
@@ -167,10 +167,10 @@ def case_gui(seed: int, work: Path, rec: dict) -> None:
                     timer.stop()
                     check(not final.is_running(), "移動が終わらない（実行中のまま）", rec)
                     check(ticks, "移動中に画面のイベントが処理されなかった", rec)
-                    res = w.flow.result.results if w.flow.stack.currentWidget() is w.flow.result else []
+                    res = w.candidates.result.results if w.candidates.stack.currentWidget() is w.candidates.result else []
                     for r in res:
                         check(os.path.exists(r.path) != (r.status == "moved"), "結果と実ファイルの状態が違う", rec)
-                    w.flow.result.next_candidates.emit()
+                    w.candidates.result.next_candidates.emit()
             elif op == "resize":
                 w.resize(*rng.choice([(911, 512), (1280, 800), (1366, 728), (880, 520)]))
             elif op == "restart":
@@ -189,7 +189,7 @@ def case_gui(seed: int, work: Path, rec: dict) -> None:
     finally:
         if w is not None:
             try:
-                w.flow.final.wait()
+                w.candidates.final.wait()
                 w.close()
                 w.deleteLater()
                 QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

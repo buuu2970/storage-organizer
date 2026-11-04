@@ -189,6 +189,7 @@ _PATHS = {
     "drive": '<rect x="3" y="12" width="18" height="7" rx="2"/><path d="M5 12 7 5h10l2 7M16 15.5h.5"/>',
     "target": '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
     "undo": '<path d="M9 14 4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3"/>',
+    "star": '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3l-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z"/>',
 }
 
 

@@ -90,7 +90,10 @@ class Env:
         make_photo(pics / "AppData" / "cache.jpg")                                    # 除外
         make_photo(pics / ".hidden" / "h.jpg")                                        # 隠しフォルダ
         make_photo(pics / "excluded_by_user" / "x.jpg")
-        os.symlink(self.home, pics / "loop", target_is_directory=True)               # 循環リンク
+        try:
+            os.symlink(self.home, pics / "loop", target_is_directory=True)           # 循環リンク
+        except OSError:  # Windows では開発者モードか管理者権限が必要（ジャンクションは test_integration で確認）
+            pass
         # 内蔵ドライブ（ドライブ全体の調査）: アプリのフォルダと小さな画像は除外する
         make_photo(self.drive / "Media" / "drive_photo.jpg", size=(1200, 900))
         (self.drive / "SomeApp").mkdir()
@@ -107,6 +110,9 @@ class Env:
             make_video(vids / "normal.mp4", "testsrc2=s=320x180:r=30", 5)
             (vids / "broken.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"x" * 500)
         self.patches = [
+            # 製品の既定は録画（動画）だけを一覧にする。FFmpeg がなくても試せるよう、テストでは画像も
+            # 「種類によらない処理」（重複・ごみ箱の安全確認・判断の保存）の題材として登録する
+            mock.patch.object(autoscan, "KIND_OF_CATEGORY", {"画像": "image", "動画": "video"}),
             mock.patch.object(autoscan, "known_folders", lambda: [
                 ("ピクチャ", str(pics)), ("ビデオ", str(vids)), ("ダウンロード", str(dl))]),
             mock.patch.object(autoscan, "local_drives", lambda: [
@@ -291,19 +297,11 @@ class CandidateTest(unittest.TestCase):
         h = self.ctx.dup_of[self.by["photo.jpg"]["id"]]
         self.assertIn(self.ctx.dup_keep[h][0], self.ctx.dup_groups[h])
 
-    def test_similar_images_are_distinct_from_exact(self):
-        pid = self.by["photo.jpg"]["id"]
-        g = self.ctx.sim_of[pid]
-        names = {self.ctx.rows[i]["name"] for i in self.ctx.sim_groups[g]}
-        self.assertTrue({"photo.jpg", "photo_small.jpg", "photo_edit.jpg"} <= names)
-        self.assertNotIn("other.png", names)
-        keep, why = self.ctx.sim_keep[g]
-        best = max(candidates.pixels(self.ctx.rows[i]) for i in self.ctx.sim_groups[g])
-        self.assertEqual(candidates.pixels(self.ctx.rows[keep]), best)  # 解像度が最も高いものを残すおすすめに
-        self.assertIn("解像度", why)
-        self.assertIn("大切さは判断していません", why)
+    def test_similar_images_are_not_grouped_in_this_release(self):
+        # 仕様（統合版）: 画像の類似検出は後回し。似ているだけの画像は候補にせず、完全一致だけを重複として扱う
+        self.assertEqual(self.ctx.sim_groups, {})
         reasons = " ".join(self.ctx.reasons(self.by["photo_small.jpg"]))
-        self.assertIn("類似画像", reasons)
+        self.assertNotIn("類似画像", reasons)
 
     def test_failure_candidates(self):
         kinds = {n: [f["kind"] for f in candidates.failures(self.by[n])] for n in
@@ -343,8 +341,8 @@ class CandidateTest(unittest.TestCase):
         self.assertGreater(big["shortage"], 0)
         names = {self.ctx.rows[i]["name"] for i in big["ids"]}
         self.assertNotIn("other.png", names)  # 理由のないファイルは提案しない
-        keep = self.ctx.sim_keep[self.ctx.sim_of[self.by["photo.jpg"]["id"]]][0]
-        self.assertNotIn(keep, big["ids"])
+        keep = self.ctx.dup_keep[self.ctx.dup_of[self.by["photo.jpg"]["id"]]][0]
+        self.assertNotIn(keep, big["ids"])  # 重複の「残す1本」は提案しない
 
 
 class TrashTest(unittest.TestCase):
@@ -479,31 +477,28 @@ class OrganizerGuiTest(unittest.TestCase):
 
     def select(self, browser, name):
         i = next(i for i, it in enumerate(browser.model.items) if it["name"] == name)
-        browser.view.setCurrentIndex(browser.model.index(i, 0))
+        browser.active_view().setCurrentIndex(browser.model.index(i, 0))
         QCoreApplication.processEvents()
 
     def test_navigation_reaches_all_sections(self):
-        # 仕様変更（初心者向け UX）: メニューを 4 つにし、容量の内訳はホームから、画像の整理はファイルを見るから開く
+        # 統合版: メニューは 5 画面（ホーム・ファイル一覧・整理のおすすめ・削除候補・設定）。容量の内訳はホームから開く
         w = self.w
         self.assertEqual([w.nav.item(i).data(0x0100) for i in range(w.nav.count())],
-                         ["ホーム", "整理する", "ファイルを見る", "設定"])
+                         ["ホーム", "ファイル一覧", "整理のおすすめ", "削除候補", "設定"])
         for page in w.sections:
             w.show_section(page)
             QCoreApplication.processEvents()
             self.assertTrue(page.isVisible())
         w.show_page(w.settings)
         self.assertIs(w.stack.currentWidget(), w.settings_page)
-        for name in ("重複", "類似画像", "録画確認候補", "大容量", "削除候補"):
-            w.show_category(name)
-            self.assertIs(w.stack.currentWidget(), w.recommend)
-            self.assertEqual(w.recommend.category, name)
-        # 仕様変更: 絞り込みは表示名（あとで決める・すべて）と保存データの値を分けた。値で確かめる
+        w.show_category("削除候補")
+        self.assertIs(w.stack.currentWidget(), w.candidates)
         for name, state in (("保護", "保護中"), ("保留", "保留"), ("すべて", "すべての判断")):
             w.show_category(name)
             self.assertIs(w.stack.currentWidget(), w.files)
             self.assertEqual(w.files.state_filter.currentData(), state)
         w.show_category("保留")
-        self.assertEqual(w.files.state_filter.currentText(), "あとで決める")
+        self.assertEqual(w.files.state_filter.currentText(), "保留")  # 画面の用語は「保留」に統一
         # 通常の動作では旧 DB（SQLite）を読み込まない（ほかのテストの影響を受けないよう、別プロセスで確かめる）
         code = ("import sys, tempfile; from PySide6.QtWidgets import QApplication; app = QApplication([]); "
                 "from storage_organizer.store import Store; from storage_organizer.main_window import MainWindow; "
@@ -523,7 +518,7 @@ class OrganizerGuiTest(unittest.TestCase):
         self.assertIn("実際の値", w.home.free.detail.text())
         w.show_section(w.files)
         self.assertIs(w.files.content.currentWidget(), w.files.empty)
-        self.assertEqual(w.files.empty.action.text(), "調べる場所を選ぶ")
+        self.assertEqual(w.files.empty.action.text(), "PCを調べる")
         self.assertIn("まだ調査していません", w.scan_status.text.text())
         self.assertFalse(w.scan_status.pause.isVisible())
         self.assertTrue(w.scan_status.rescan.isVisible())
@@ -544,10 +539,14 @@ class OrganizerGuiTest(unittest.TestCase):
     def test_home_after_scan(self):
         self.scan()
         home = self.w.home
-        total = sum(r["size"] for r in self.state.ctx.rows.values() if r["kind"] == "video")
+        videos = [r for r in self.state.ctx.rows.values() if r["kind"] == "video"]
+        total = sum(r["size"] for r in videos)
         self.assertEqual(home.primary.text(), "おすすめを確認する")  # 仕様変更: 主操作の名称
-        self.assertEqual(home.total.value.text(), format_size(total))  # 録画（動画）だけの合計
+        self.assertEqual(home.total.value.text(), f"{len(videos):,} 本")  # 録画（動画）の件数と合計容量
+        self.assertIn(format_size(total), home.total.detail.text())
         self.assertIn("ドライブ全体の使用量とは別", home.total.detail.text())
+        self.assertTrue(home.cand.value.text().endswith("本"))  # 整理候補の件数
+        self.assertTrue(home.selected.isVisible())  # 選んだ削除候補の合計
         self.assertNotEqual(home.saving.value.text(), "算出できません")
         # 仕様変更: 主操作「おすすめを確認する」は目標なしで候補へ。目標は「この目標で提案」から
         home.primary.click()
@@ -581,7 +580,7 @@ class OrganizerGuiTest(unittest.TestCase):
         self.assertTrue(w.ctx.db.video(mid)["protected"])
         self.assertIsNone(w.ctx.db.video(mid)["decision"])  # 保護すると削除候補から外れる
         # 複数選択
-        f.view.selectAll()
+        f.active_view().selectAll()
         QCoreApplication.processEvents()
         self.assertEqual(f.detail.stack.currentIndex(), 1)
         self.assertIn(f"{len(f.model.items)} 件を選択", f.detail.title.text())
@@ -601,58 +600,60 @@ class OrganizerGuiTest(unittest.TestCase):
         self.assertEqual(f.empty.action.text(), "条件をクリア")
         f.empty.action.click()
         self.assertEqual(f.search.text(), "")
-        f.kind_filter.setCurrentIndex(2)
-        self.assertTrue(all(it["kind"] == "video" for it in f.model.items))
+        self.assertFalse(f.kind_filter.isVisible())  # 統合版は録画だけを一覧にするため、種類の絞り込みは出さない
+        # お気に入りの絞り込みと、一覧の列（形式・お気に入り・保護・理由）
+        self.select(f, "other.png")
+        f.selection_bar.favorite.click()
+        oid = next(r["id"] for r in w.ctx.db.media() if r["name"] == "other.png")
+        self.assertTrue(w.ctx.db.video(oid)["favorite"])
+        f.state_filter.setCurrentIndex(f.state_filter.findData("お気に入り"))
+        self.assertEqual([it["name"] for it in f.model.items], ["other.png"])
+        self.assertEqual(f.model.headerData(5, Qt.Orientation.Horizontal), "お気に入り")
+        self.assertEqual(f.model.data(f.model.index(0, 5)), "★")
+        self.assertEqual(f.model.data(f.model.index(0, 1)), "PNG")
 
-    def test_recommend_groups_compare_and_trash(self):
-        from storage_organizer import organizer
+    def test_candidates_page_final_confirmation_and_trash(self):
         self.scan()
         w = self.w
-        w.show_category("重複")
-        r = w.recommend
-        self.assertEqual(r.model.rowCount(), 1)
-        r.view.setCurrentIndex(r.model.index(0, 0))
-        QCoreApplication.processEvents()
-        self.assertFalse(r.selection_bar.delete.isVisible())  # グループ全体を一度に削除候補にしない
-        self.assertIs(r.detail.stack.currentWidget(), r.detail.compare_scroll)
-        self.assertTrue(wait_until(lambda: all(lb.pixmap() is not None and not lb.pixmap().isNull()
-                                               for lb in r.detail.compare.thumbs.values()), 20))
-        r.detail.compare.keep_others_button.click()
-        decisions = sorted(row["decision"] or "" for row in w.ctx.db.media()
-                           if row["id"] in self.state.ctx.dup_of)
-        self.assertEqual(decisions, ["削除候補", "残す"])
-        w.show_category("大容量")
-        self.assertIs(r.content.currentWidget(), r.empty)
-        self.assertIn("候補はありません", r.empty.title.text())
-        w.show_category("削除候補")
-        self.assertTrue(r.trash_button.isVisible())
-        self.assertEqual(r.trash_button.property("kind"), "danger")
-        ids = [row["id"] for row in w.ctx.db.media() if row["decision"] == "削除候補"]
+        db = w.ctx.db
+        copy = next(r["id"] for r in db.media() if r["name"] == "photo_copy.jpg")
+        prot = next(r["id"] for r in db.media() if r["name"] == "other.png")
+        db.set_decision(copy, "削除候補")
+        self.state.refresh()
+        w.show_candidates()
+        c = w.candidates
+        self.assertIs(c.stack.currentWidget(), c.browser)
+        self.assertEqual([it["name"] for it in c.browser.model.items], ["photo_copy.jpg"])
+        self.assertTrue(c.browser.trash_button.isVisible())
+        self.assertEqual(c.browser.trash_button.property("kind"), "danger")  # 赤は実際に移す操作だけ
+        self.assertIn("空き容量は増えません", c.browser.footer.text())
+        c.browser.trash_button.click()
+        self.assertIs(c.stack.currentWidget(), c.final)
+        self.assertIn("1 件", c.final.summary.text())  # 件数・合計容量
+        self.assertEqual(c.final.trash_table.item(0, 0).text(), "photo_copy.jpg")  # 名前・保存場所・容量
+        self.assertEqual(c.final.trash_table.item(0, 2).text(), str(self.env.home / "Downloads"))
         moved = []
 
         def fake_backend(path):  # 実際には削除しない
             moved.append(path)
             os.rename(path, path + ".trashed-by-test")
-        dlg = organizer.TrashDialog(w.ctx.db, ids, w, backend=fake_backend)
-        self.assertIn(f"{len(ids)} 件", dlg.summary.text())
-        dlg.execute()
+        c.final.backend = fake_backend
+        # 確認で「いいえ」を選ぶと何もしない
+        with mock.patch.object(type(c.final), "confirm", lambda self, n, t: False):
+            c.final.move_button.click()
+        self.assertEqual(moved, [])
+        self.assertFalse(c.final.is_running())
+        c.final.move_button.click()
+        c.final.move_button.click()  # 二重に押しても1回だけ
+        self.assertTrue(wait_until(lambda: (QCoreApplication.processEvents() or True) and not c.final.is_running(), 30))
+        QCoreApplication.processEvents()
         self.assertEqual(len(moved), 1)
-        w.show_category("類似画像")
-        self.assertGreaterEqual(r.model.rowCount(), 1)
-
-    def test_target_dialog(self):
-        from storage_organizer import organizer
-        self.scan()
-        dlg = organizer.TargetDialog(self.w.recommend)
-        dlg.target.setValue(0.0001)
-        dlg.propose()
-        self.assertGreater(dlg.table.rowCount(), 0)
-        before = dlg.result.text()
-        dlg.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
-        self.assertNotEqual(dlg.result.text(), before)
-        dlg.target.setValue(100000)
-        dlg.propose()
-        self.assertIn("不足", dlg.result.text())
+        self.assertIs(c.stack.currentWidget(), c.result)
+        self.assertIn("ごみ箱へ移動: 1 件", c.result.summary.text())
+        # 保護中は削除候補にできない
+        db.set_protected(prot, True)
+        w.state.decide("削除候補", [prot])
+        self.assertIsNone(db.video(prot)["decision"])
 
     def test_status_while_scanning(self):
         w = self.w
@@ -687,9 +688,7 @@ class OrganizerGuiTest(unittest.TestCase):
         # プレビューできないファイルでも「既定のアプリで開く」を案内する
         w.show_section(w.files)
         f = w.files
-        i = next(i for i, it in enumerate(f.model.items) if it["name"] == "notimage.jpg")
-        f.view.setCurrentIndex(f.model.index(i, 0))
-        QCoreApplication.processEvents()
+        self.select(f, "notimage.jpg")
         self.assertEqual(f.detail.preview_msg.action.text(), "既定のアプリで開く")
         opened = []
         with mock.patch("PySide6.QtGui.QDesktopServices.openUrl", side_effect=lambda u: opened.append(u.toLocalFile())):
@@ -722,7 +721,7 @@ class OrganizerGuiTest(unittest.TestCase):
             self.select(w.files, "photo.jpg")
             QCoreApplication.processEvents()
             bar = w.files.selection_bar
-            for b in (bar.keep, bar.hold, bar.delete, bar.protect, bar.more):
+            for b in (bar.keep, bar.hold, bar.delete, bar.protect, bar.favorite, bar.more):
                 self.assertTrue(b.isVisible())
                 self.assertGreaterEqual(b.width(), b.sizeHint().width() - 2, f"{b.text()} が切れています")
             self.assertTrue(w.scan_status.rescan.isVisible())
@@ -795,7 +794,7 @@ class PlanEngineTest(unittest.TestCase):
         # 保護したコピーを「残す1本」にするので、元のファイルは重複分として提案してよい
         self.assertEqual(set(names), {"a_original.mp4"})
         self.assertEqual(names["a_original.mp4"]["keep_id"], self.rows["a_copy1.mp4"])
-        self.assertEqual(p["excluded"], {"保護": 1, "残す": 1, "オンライン専用": 1})
+        self.assertEqual(p["excluded"], {"保護": 1, "お気に入り": 0, "残す": 1, "オンライン専用": 1})
         self.assertFalse(p["achieved"])
         self.assertEqual(p["shortage"], 9 * self.GB)  # 無理に候補を足さず、不足分を表示
 
@@ -938,19 +937,6 @@ class SurvivorCheckTest(unittest.TestCase):
         results = {r.media_id: r.status for r in trash.move_to_trash(self.db, [ok_id, prot, bad], flaky)}
         self.assertEqual(results, {ok_id: "moved", prot: "skipped", bad: "failed"})
 
-    def test_trash_dialog_cannot_run_twice(self):
-        from storage_organizer import organizer
-        if QApplication is None:
-            self.skipTest("PySide6 がありません")
-        QApplication.instance() or QApplication([])
-        mid = self.by[str(self.env.home / "Downloads" / "photo_copy.jpg")]
-        calls = []
-        dlg = organizer.TrashDialog(self.db, [mid], None, backend=lambda p: (calls.append(p), self.backend(p)))
-        with mock.patch.object(QMessageBox, "information"), mock.patch.object(QMessageBox, "warning"):
-            dlg.execute()
-            dlg.execute()  # 2回目は何もしない
-        self.assertEqual(len(calls), 1)
-
     def test_partial_failure_is_reported_separately(self):
         ids = [self.by[str(self.env.home / "Downloads" / "photo_copy.jpg")],
                self.by[str(self.env.home / "Pictures" / "other.png")]]
@@ -1029,28 +1015,6 @@ class SameFileTest(unittest.TestCase):
         plan = candidates.plan_recordings(ctx, 10 ** 9)
         self.assertEqual(len(plan["items"]), 1)
         self.assertNotIn(b, [it["id"] for it in plan["items"]])
-
-    def test_legacy_database_is_migrated(self):
-        """仕様変更（DB 廃止）: 旧版の SQLite から、設定・保護・判断を表記を統一して取り込む（旧 DB は消さない）。"""
-        from storage_organizer import legacy_db, migrate
-        old_dir = Path(self._tmp.name) / "old"
-        old = legacy_db.Database(old_dir)
-        alias = str(self.dir) + os.sep + "." + os.sep + "rec.mp4"
-        rec = scanner.FileRecord("rec.mp4", 10, "動画", 1.0, str(self.dir) + os.sep + ".")
-        old.register_videos([rec])
-        old.conn.execute("UPDATE videos SET path=?, protected=1, decision='保留' WHERE name='rec.mp4'", (alias,))
-        old.set_json_list("extra_locations", [str(self.dir) + os.sep + "." + os.sep])
-        old.set_setting("ffmpeg_dir", "C:/ffmpeg/bin")
-        old.close()
-        result = migrate.migrate_from_legacy(old_dir / "recsort.db", self.db)
-        self.assertEqual(result["files"], 1)
-        state = json.loads((self.data / "user_state.json").read_text(encoding="utf-8"))
-        self.assertEqual(state[str(self.file)], {"protected": 1, "decision": "保留"})  # 表記を統一したパスで保存
-        self.assertEqual(self.db.json_list("extra_locations"), [str(self.dir)])
-        self.assertEqual(self.db.get_setting("ffmpeg_dir"), "C:/ffmpeg/bin")
-        self.assertTrue((old_dir / "recsort.db").exists())
-        mid = self.insert(str(self.file))
-        self.assertTrue(self.db.video(mid)["protected"])  # 移行後に見つかったファイルにも保護が付く
 
     def test_new_scans_store_one_spelling(self):
         self.db.set_json_list("extra_locations", [str(self.dir) + os.sep + "." + os.sep])
@@ -1195,7 +1159,8 @@ class CapacitySurveyTest(unittest.TestCase):
             self.assertEqual(cats["開発用フォルダ"][1], 9000 + 2)  # 容量は数えるが候補にはしない
             self.assertEqual(stats["by_folder"]["report"][1], 3000)
             self.assertEqual(stats["top_files"][0][0], 5000)  # 大きいファイルの順
-            self.assertEqual({r["name"] for r in db.media()}, {"photo.jpg"})  # 一覧に入るのは画像・動画だけ
+            self.assertEqual({r["name"] for r in db.media()}, set())  # 一覧に入るのは録画だけ（画像は容量の集計だけ）
+            self.assertEqual(cats["画像"][1], 2002)
             self.assertTrue(any("開発用" in a[2] for a in stats["areas"]))
             db.close()
 
@@ -1256,6 +1221,7 @@ class ErrorLogTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             try:
                 app.install_error_log(tmp)
+                app.install_error_log(tmp)  # 2回呼んでも前のファイルを開いたままにしない
                 home = os.path.expanduser("~")
                 with mock.patch.object(sys, "__excepthook__", lambda *a: None), \
                         mock.patch("PySide6.QtWidgets.QMessageBox.warning"):
@@ -1266,9 +1232,11 @@ class ErrorLogTest(unittest.TestCase):
                 text = (Path(tmp) / "logs" / "recsort-error.log").read_text(encoding="utf-8")
             finally:
                 sys.excepthook = old
+                app.close_error_log()  # 開いたままだと Windows では一時フォルダを消せない
+        from storage_organizer import __version__
         self.assertIn("%USERPROFILE%", text)
         self.assertNotIn(home + "/", text)
-        self.assertIn("RecSort 0.9.0rc3", text)  # バージョン更新
+        self.assertIn(f"RecSort {__version__}", text)
 
 
 class SourceCodeTest(unittest.TestCase):
@@ -1466,9 +1434,11 @@ class PlanGuiTest(unittest.TestCase):
             moved.append(path)
             os.rename(path, path + ".trashed-by-test")
 
-        # 仕様変更: 最終確認はダイアログではなく「最終確認」画面 →「結果」画面で行う
+        # 統合版: 「削除候補に追加」→「削除候補」画面 →「最終確認」画面 →「結果」画面
         p.final_button.click()
-        flow = w.flow
+        self.assertIs(w.stack.currentWidget(), w.candidates)
+        w.candidates.browser.trash_button.click()
+        flow = w.candidates
         self.assertIs(flow.stack.currentWidget(), flow.final)
         self.assertIn("件・合計", flow.final.summary.text())
         self.assertGreater(flow.final.keep_table.rowCount(), 0)  # 残すファイル（重複で残す1本）を分けて示す
@@ -1613,6 +1583,7 @@ class PlanGuiTest(unittest.TestCase):
     def _kind_of(self, p, mid):
         return next((it["kind"] for it in p.plan["items"] if it["id"] == mid), None)
 
+    @unittest.skipUnless(FFMPEG.available, "FFmpeg がありません")
     def test_compare_flow_keep_this_and_final(self):
         w = self.w
         subprocess.run([FFMPEG.ffmpeg, "-v", "error", "-i", str(self.env.home / "Videos" / "normal.mp4"), "-vf",
@@ -1647,11 +1618,12 @@ class PlanGuiTest(unittest.TestCase):
         self.assertEqual(w.ctx.db.video(orig)["decision"], "残す")
         self.assertEqual(w.ctx.db.video(low)["decision"], "削除候補")
         self.assertTrue(os.path.exists(w.ctx.db.video(low)["path"]))  # 比較中はファイルを移動しない
-        cmp.next_button.click()
-        self.assertIs(w.flow.stack.currentWidget(), w.flow.final)
-        self.assertIn(low, w.flow.final.ids)
-        self.assertNotIn(orig, w.flow.final.ids)
-        w.flow.final.back_button.click()
+        cmp.next_button.click()  # 統合版: 削除候補に保存して「削除候補」画面へ（ここでは移動しない）
+        self.assertIs(w.stack.currentWidget(), w.candidates)
+        listed = [it["id"] for it in w.candidates.browser.model.items]
+        self.assertIn(low, listed)
+        self.assertNotIn(orig, listed)
+        w.show_plan(None)
         self.assertIs(w.flow.stack.currentWidget(), w.plan)
         # すべて残す・保留
         w.open_group("similar", n)
@@ -1683,7 +1655,7 @@ class PlanGuiTest(unittest.TestCase):
         w.show_section(w.files)
         f = w.files
         i = next(i for i, it in enumerate(f.model.items) if it["name"] == "notimage.jpg")
-        f.view.setCurrentIndex(f.model.index(i, 0))
+        f.active_view().setCurrentIndex(f.model.index(i, 0))
         QCoreApplication.processEvents()
         self.assertIs(f.detail.preview_stack.currentWidget(), f.detail.preview_msg)
         self.assertIn("プレビューできません", f.detail.preview_msg.title.text())

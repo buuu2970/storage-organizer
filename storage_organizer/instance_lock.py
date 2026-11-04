@@ -19,22 +19,32 @@ class InstanceLock:
         self.path = Path(data_dir) / "instance.lock"
         self._fh = None
 
-    def acquire(self) -> "InstanceLock":
+    def acquire(self, wait: float = 2.0) -> "InstanceLock":
+        """ロックを取る。取れなければ wait 秒まで待ってから AlreadyRunning。
+
+        Windows では、異常終了したプロセスのロックが OS に解放されるまで少し時間がかかるため、短く待ち直す。
+        """
+        import time
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(self.path, "a+")
-        try:
-            if os.name == "nt":
-                import msvcrt
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            fh.close()
-            raise AlreadyRunning(str(e)) from e
-        self._fh = fh
-        return self
+        deadline = time.monotonic() + wait
+        while True:
+            fh = open(self.path, "a+")
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                fh.close()
+                if time.monotonic() >= deadline:
+                    raise AlreadyRunning(str(e)) from e
+                time.sleep(0.1)
+                continue
+            self._fh = fh
+            return self
 
     def release(self) -> None:
         if self._fh is None:

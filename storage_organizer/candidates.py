@@ -1,7 +1,9 @@
 """整理候補の判定（担当: 候補判定）。
 
 内容の面白さや大切さは判断しない。候補にした理由（重複・類似・失敗の可能性・容量）を必ず添える。
-「不要」とは表示せず、「整理候補」「確認候補」とする。
+「不要」とは表示せず、「整理候補」「確認候補」とする。機械学習は使わない（決まったルールだけで判定する）。
+読み込めないことは「破損」の証明ではないので、「再生できない可能性」「読み込み失敗」と表示する。
+保護中・お気に入り・「残す」の録画は、おすすめに含めない。
 """
 
 from __future__ import annotations
@@ -19,8 +21,12 @@ SHORT_VIDEO_SEC = 3.0
 SIMILAR_THRESHOLD = 5  # dHash（64ビット）のハミング距離。これ以下を「似ている」とする
 _BANDS = 6  # 類似候補を絞るための区切り（ハミング距離5以下なら必ずどこかの区切りが一致する）
 
-FAILURE_LABEL = {"short": "極端に短い録画", "dark": "ほぼ真っ暗", "read_error": "読み込みエラー",
-                 "corrupt": "破損を確認"}
+SILENT_DB = -50.0  # 確認した区間の最大音量がこれ未満なら「ほぼ無音」（音声トラックがある録画だけ）
+
+FAILURE_LABEL = {"short": "極端に短い録画", "dark": "黒画面が多い", "read_error": "読み込み失敗",
+                 "corrupt": "再生できない可能性", "silent": "音声がほぼ無音"}
+# 一覧に出す短い理由
+SHORT_LABEL = {"short": "短い", "dark": "黒画面", "read_error": "読込失敗", "corrupt": "再生不可?", "silent": "無音"}
 
 
 # =============================================================================
@@ -122,9 +128,33 @@ def analyze_video_light(tools: media.FFmpegTools, path: str, cancel=None) -> dic
             if feat["black_ratio"] >= 0.99 or (feat["frames"] >= 3 and feat["brightness"] < 0.04):
                 failures.append({"kind": "dark", "reason": "確認した3場面がほぼ真っ暗です"
                                                           "（音声だけの録画や暗い場面の可能性もあります）"})
-        except RuntimeError:
+        except (RuntimeError, TimeoutError):
             failures.append({"kind": "read_error", "reason": "映像の場面を取り出せませんでした。破損とは限りません"})
+    silent = silence_failure(tools, path, info, cancel)
+    if silent:
+        failures.append(silent)
     return {"state": "完了", "meta": info, "taken_at": taken, "failures": failures}
+
+
+def silence_failure(tools: media.FFmpegTools, path: str, info: dict, cancel=None) -> dict | None:
+    """音声トラックがあるのに、確認したすべての区間がほぼ無音なら理由を返す。
+
+    測れなかった区間があるとき・時間切れのときは判定しない（無音と決めつけない）。
+    """
+    duration = info.get("duration") or 0
+    if not info.get("has_audio") or duration <= 0:
+        return None
+    try:
+        values = media.measure_max_volume(tools, path, duration, 3, cancel)
+    except (RuntimeError, TimeoutError, OSError):
+        return None
+    expected = 3 if duration > media.VOLUME_SEGMENT_SEC * 2 else 1
+    if len(values) < expected or not all(v < SILENT_DB for v in values):
+        return None
+    loudest = max(values)
+    shown = "測定できないほど小さい音" if loudest == float("-inf") else f"{loudest:.0f} dB"
+    return {"kind": "silent", "reason": f"確認した {len(values)} か所（各 {int(media.VOLUME_SEGMENT_SEC)} 秒まで）の"
+                                        f"最大音量が {shown} で、ほぼ無音です（音声を録らない設定の可能性もあります）"}
 
 
 def light_analyze(db: Database, row, tools: media.FFmpegTools, cancel=None) -> str:
@@ -302,8 +332,7 @@ def run_analysis(db: Database, tools: media.FFmpegTools, ctl, report) -> bool:
         return False
     if not find_similar_videos(db, tools, ctl, report):
         return False
-    report({"phase": "similar", "text": "似た画像をまとめています…"})
-    group_similar_images(db)
+    # 画像の整理（類似画像のまとめ）は今の版では行わない（録画の整理を優先する）
     report({"phase": "done", "text": "", "refresh": True})
     return True
 
@@ -447,18 +476,37 @@ class Context:
                 text += f"。{why}"
             out.append(text)
         for f in failures(row):
-            out.append(f"{FAILURE_LABEL[f['kind']]}: {f['reason']}")
+            out.append(f"{FAILURE_LABEL.get(f['kind'], f['kind'])}: {f['reason']}")
         if self.is_large(row):
             text = "大容量: 容量の大きいファイルです"
             pm = per_minute(row)
             if pm:
-                text += f"（1分あたり {pm / 1024 ** 2:,.1f} MB。これだけでは整理候補と判断しません）"
-            out.append(text)
+                text += f"（1分あたり {pm / 1024 ** 2:,.1f} MB）"
+            out.append(text + "。容量が大きいだけでは削除をおすすめしません")
+        if row.get("favorite"):
+            out.append("お気に入りのため、整理のおすすめには含めません（お気に入りを外すと対象に戻ります）")
+        if row["protected"]:
+            out.append("保護中のため、おすすめ・ごみ箱への移動の対象になりません")
         return out
+
+    def short_reasons(self, row) -> list[str]:
+        """一覧の「理由」列に出す短い見出し。"""
+        out = []
+        h = self.dup_of.get(row["id"])
+        if h:
+            out.append("重複（残す側）" if self.dup_keep[h][0] == row["id"] else "重複")
+        if self.vgroup_of.get(row["id"]) is not None:
+            out.append("類似")
+        for f in failures(row):
+            out.append(SHORT_LABEL.get(f["kind"], f["kind"]))
+        if self.is_large(row):
+            out.append("大容量")
+        return list(dict.fromkeys(out))
 
     def is_suggestable(self, row) -> bool:
         """目標容量の提案に含めてよい候補（大容量だけの理由では含めない）。"""
-        if row["protected"] or row["decision"] == "残す" or row["cloud_only"] or row["id"] in self.aliases:
+        if row["protected"] or row.get("favorite") or row["decision"] == "残す" or row["cloud_only"] \
+                or row["id"] in self.aliases:
             return False
         h = self.dup_of.get(row["id"])
         if h and self.dup_keep[h][0] != row["id"]:
@@ -472,7 +520,10 @@ class Context:
 def keep_for_duplicates(rows) -> tuple[int, str]:
     protected = [r for r in rows if r["protected"]]
     if protected:
-        return protected[0]["id"], "「絶対に残す」が付いています"
+        return protected[0]["id"], "保護されています"
+    favorite = [r for r in rows if r.get("favorite")]
+    if favorite:
+        return favorite[0]["id"], "お気に入りです"
     best = min(rows, key=lambda r: (r["mtime"], len(r["path"])))
     return best["id"], "最も古くから保存されているファイルです"
 
@@ -518,6 +569,9 @@ def keep_for_similar_videos(rows, detail: dict | None = None) -> tuple[int | Non
     protected = [r for r in rows if r["protected"]]
     if protected:
         return protected[0]["id"], "保護されています"
+    favorite = [r for r in rows if r.get("favorite")]
+    if len(favorite) == 1:
+        return favorite[0]["id"], "お気に入りの録画です"
     kept = [r for r in rows if r["decision"] == "残す"]
     if len(kept) == 1:
         return kept[0]["id"], "「残す」を選んだ録画です"
@@ -554,7 +608,7 @@ def keep_for_similar(rows) -> tuple[int, str]:
     return best["id"], f"解像度が最も高い（{meta.get('width')}×{meta.get('height')}）。大切さは判断していません"
 
 
-CATEGORIES = ["すべて", "重複", "類似画像", "録画確認候補", "大容量", "保護", "保留", "削除候補"]
+CATEGORIES = ["すべて", "重複", "類似画像", "録画確認候補", "大容量", "保護", "お気に入り", "保留", "削除候補"]
 
 
 def category_ids(ctx: Context, category: str) -> list[int]:
@@ -569,6 +623,8 @@ def category_ids(ctx: Context, category: str) -> list[int]:
         return [r["id"] for r in rows if ctx.is_large(r)]
     if category == "保護":
         return [r["id"] for r in rows if r["protected"]]
+    if category == "お気に入り":
+        return [r["id"] for r in rows if r.get("favorite")]
     if category == "保留":
         return [r["id"] for r in rows if r["decision"] == "保留"]
     if category == "削除候補":
@@ -697,17 +753,18 @@ def drive_space(paths) -> list[dict]:
     return result
 
 
-def _review_reasons(row, now_ts: float) -> list[str]:
+def _review_reasons(row, now_ts: float, failures_only: bool = False) -> list[str]:
     reasons = []
     for f in failures(row):
-        prefix = {"corrupt": "破損を確認: ", "read_error": "読み込みエラー: "}.get(f["kind"], "")
-        reasons.append(prefix + f["reason"])
+        reasons.append(f"{FAILURE_LABEL.get(f['kind'], f['kind'])}: {f['reason']}")
+    if failures_only:
+        return reasons
     if row["size"] >= REVIEW_LARGE_BYTES:
         text = f"容量が大きい録画です（{_fmt(row['size'])}）"
         pm = per_minute(row)
         if pm:
             text += f"。1分あたり {_fmt(int(pm))}"
-        reasons.append(text + "。内容を確認してください")
+        reasons.append(text + "。容量が大きいだけでは削除をおすすめしません。内容を確認してください")
     days = (now_ts - row["mtime"]) / 86400
     if days >= REVIEW_OLD_DAYS and row["size"] >= REVIEW_OLD_MIN_BYTES:
         reasons.append(f"約 {int(days // 30)} か月更新されていません（視聴したかどうかは分かりません）")
@@ -760,7 +817,7 @@ def plan_recordings(ctx: Context, target_bytes: int | None, include_images: bool
     # 空けたいドライブにあるファイルだけを候補にする（別ドライブの整理では目的のドライブは空かない）
     on_drive = {i for i, r in all_rows.items() if drive is None or drive_of(r["path"]) == drive}
     rows = {i: all_rows[i] for i in on_drive}
-    excluded = {"保護": 0, "残す": 0, "オンライン専用": 0}
+    excluded = {"保護": 0, "お気に入り": 0, "残す": 0, "オンライン専用": 0}
 
     def usable(r) -> bool:
         if r["decision"] == "保留":
@@ -770,6 +827,9 @@ def plan_recordings(ctx: Context, target_bytes: int | None, include_images: bool
             return False
         if r["protected"]:
             excluded["保護"] += 1
+            return False
+        if r.get("favorite"):  # お気に入りは「残す」に近い扱い（お気に入りを外すと対象に戻る）
+            excluded["お気に入り"] += 1
             return False
         if r["decision"] == "残す":
             excluded["残す"] += 1
@@ -791,9 +851,12 @@ def plan_recordings(ctx: Context, target_bytes: int | None, include_images: bool
         if len(alive) < 2 or not any(m in rows for m in alive):
             continue  # 実在するコピーが1本以下なら、重複分はない
         protected = [m for m in alive if all_rows[m]["protected"]]
+        favorite = [m for m in alive if all_rows[m].get("favorite")]
         elsewhere = [m for m in alive if m not in on_drive]
         if protected:
             keep_id, why = protected[0], "保護されています"
+        elif favorite:
+            keep_id, why = favorite[0], "お気に入りです"
         elif elsewhere:
             keep_id = min(elsewhere, key=lambda m: (all_rows[m]["mtime"], len(all_rows[m]["path"])))
             why = f"別のドライブ（{drive_of(all_rows[keep_id]['path'])}）にあるコピーを残します"
@@ -854,17 +917,19 @@ def plan_recordings(ctx: Context, target_bytes: int | None, include_images: bool
         total += it["size"]
     in_groups = set(ctx.vgroup_of) | set(ctx.dup_of)
     review_pool = []
-    if total < target_bytes and not no_target:
-        # 重複だけで届かない場合だけ、根拠のある「要確認」候補を追加する（残す1本は対象外）
+    if no_target or total < target_bytes:
+        # 目標なし: 客観的な問題（極端に短い・黒画面・読み込み失敗・無音など）がある録画を「要確認」として示す
+        # 目標あり: 重複だけで届かない場合だけ、容量が大きい・長く更新がない録画も「要確認」に加える
+        # どちらも初期状態ではチェックしない（内容を確認してから選ぶ）
         for i in usable_ids - keep_ids - {it["id"] for it in dup_items} - in_groups:
-            reasons = _review_reasons(rows[i], now_ts)
+            reasons = _review_reasons(rows[i], now_ts, failures_only=no_target)
             if reasons and exists[i]:
                 review_pool.append({"id": i, "kind": "review", "label": "要確認", "size": rows[i]["size"],
                                     "keep_id": None, "reasons": reasons, "failure": bool(failures(rows[i]))})
         review_pool.sort(key=lambda it: (not it["failure"], -it["size"]))
         for it in review_pool:
             if total >= target_bytes:
-                break
+                break  # 目標なしのときは target_bytes が無限大なので、すべて示す
             chosen.append(it)
             total += it["size"]
     dup_total = sum(it["size"] for it in chosen if it["kind"] == "duplicate")

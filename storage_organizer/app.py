@@ -28,6 +28,22 @@ def _scrub(text: str) -> str:
     return text
 
 
+_crash_log: dict = {"fh": None}
+
+
+def close_error_log() -> None:
+    """異常終了の記録を止めて、ログファイルを閉じる（Windows では開いたままだと消せない・動かせない）。"""
+    import faulthandler
+    fh = _crash_log["fh"]
+    if fh is not None:
+        faulthandler.disable()
+        try:
+            fh.close()
+        except OSError:
+            pass
+        _crash_log["fh"] = None
+
+
 def install_error_log(data_dir) -> None:
     """想定外のエラーを、アプリのデータ保存先の logs に記録して知らせる。
 
@@ -38,13 +54,14 @@ def install_error_log(data_dir) -> None:
     log_dir = Path(data_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "recsort-error.log"
+    close_error_log()  # 2回目の呼び出しで前のファイルを開いたままにしない
     try:  # Python の例外にならない異常終了（Windows の API の中など）でも、どこで落ちたかを残す
         import faulthandler
         crash = log_dir / "recsort-crash.log"
         if crash.exists() and crash.stat().st_size > 1024 * 1024:
             crash.unlink()
-        install_error_log._crash_fh = open(crash, "a", encoding="utf-8")
-        faulthandler.enable(file=install_error_log._crash_fh, all_threads=True)
+        _crash_log["fh"] = open(crash, "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_log["fh"], all_threads=True)
     except OSError:
         pass
     shown = {"done": False}
@@ -90,9 +107,11 @@ def main() -> int:
                             "保護や判断の記録が食い違わないよう、同時に2つは起動できません。"
                             "起動中のウィンドウを使ってください。")
         return 1
-    install_error_log(data_dir)
-    window = MainWindow(Store(data_dir))
-    window.show()
-    code = app.exec()
-    lock.release()
-    return code
+    try:
+        install_error_log(data_dir)
+        window = MainWindow(Store(data_dir))
+        window.show()
+        return app.exec()
+    finally:
+        close_error_log()
+        lock.release()

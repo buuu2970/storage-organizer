@@ -10,7 +10,7 @@ import os
 _CATEGORY_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "動画": (
         ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
-        ".mpg", ".mpeg", ".ts", ".m2ts", ".3gp",
+        ".mpg", ".mpeg", ".ts", ".m2ts", ".mts", ".m2t", ".vob", ".3gp",
     ),
     "画像": (
         ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif",

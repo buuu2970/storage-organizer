@@ -1,8 +1,9 @@
-"""FFmpeg を使った動画の読み取り処理（解析・サムネイル・ハッシュ・圧縮）。
+"""FFmpeg を使った動画の読み取り処理（解析・サムネイル・ハッシュ・音量の確認）。
 
 安全上の方針:
 - 元の動画は読み取るだけで、変更・上書き・削除しない
-- 書き込むのはアプリのキャッシュ（サムネイル）と、圧縮時にユーザーが選んだ出力先の新規ファイルだけ
+- 書き込むのはアプリのキャッシュ（サムネイル・比較用の場面）だけ
+- FFmpeg は探すだけで、自動でインストールしない
 - クラウド上のみのファイルは中身を読まない（勝手にダウンロードさせない）
 - 読み取りの前後でファイル状態を比べ、途中で変わったら結果を使わない
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,8 +27,6 @@ import numpy as np
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
 
 FRAME_W, FRAME_H = 32, 18
-AUDIO_RATE = 8000
-AUDIO_SEGMENT_SEC = 3.0
 MAX_FRAMES = 80
 
 
@@ -43,21 +43,64 @@ class FileChanged(Exception):
 class FFmpegTools:
     ffmpeg: str | None
     ffprobe: str | None
+    source: str = ""  # どこで見つけたか（設定画面の表示用）
 
     @property
     def available(self) -> bool:
         return bool(self.ffmpeg and self.ffprobe)
 
 
+def _exe(name: str) -> str:
+    return name + ".exe" if sys.platform == "win32" else name
+
+
+def _pair_in(folder) -> tuple[str, str] | None:
+    """同じフォルダに ffmpeg と ffprobe の両方があるときだけ返す（別々の版を組み合わせない）。"""
+    if not folder:
+        return None
+    a, b = Path(folder) / _exe("ffmpeg"), Path(folder) / _exe("ffprobe")
+    return (str(a), str(b)) if a.is_file() and b.is_file() else None
+
+
+def winget_ffmpeg_dirs(local_appdata: str | None = None) -> list[str]:
+    """WinGet で入れた FFmpeg の bin フォルダ候補（インストールはしない。探すだけ）。
+
+    WinGet はコマンドの入口を Links に、本体を Packages\\<パッケージ名>\\...\\bin に置く。
+    """
+    base = local_appdata if local_appdata is not None else os.environ.get("LOCALAPPDATA", "")
+    if not base:
+        return []
+    root = Path(base) / "Microsoft" / "WinGet"
+    found = [str(root / "Links")]
+    packages = root / "Packages"
+    try:
+        dirs = sorted((p for p in packages.iterdir() if p.is_dir() and "ffmpeg" in p.name.lower()),
+                      key=lambda p: p.name)
+    except OSError:
+        dirs = []
+    for pkg in dirs:
+        try:  # 例: Gyan.FFmpeg_...\ffmpeg-7.1-full_build\bin\ffmpeg.exe
+            found += sorted({str(p.parent) for p in pkg.glob("**/bin/" + _exe("ffmpeg"))}, reverse=True)
+        except OSError:
+            continue
+    return found
+
+
 def find_ffmpeg(custom_dir: str | None = None) -> FFmpegTools:
-    def find(name: str) -> str | None:
-        if custom_dir:
-            for candidate in (name, name + ".exe"):
-                p = Path(custom_dir) / candidate
-                if p.is_file():
-                    return str(p)
-        return shutil.which(name)
-    return FFmpegTools(find("ffmpeg"), find("ffprobe"))
+    """FFmpeg を探す: 設定のフォルダ → PATH → WinGet（Links・Packages）。見つからなければ利用不可。"""
+    if custom_dir:
+        pair = _pair_in(custom_dir)
+        if pair:
+            return FFmpegTools(*pair, "設定で指定したフォルダ")
+    ff, fp = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    if ff and fp:
+        return FFmpegTools(ff, fp, "PATH")
+    if sys.platform == "win32":
+        for folder in winget_ffmpeg_dirs():
+            pair = _pair_in(folder)
+            if pair:
+                return FFmpegTools(*pair, "WinGet でインストールされた FFmpeg")
+    return FFmpegTools(None, None)
 
 
 def _run(args: list[str], cancel: threading.Event | None = None, timeout: float = 120,
@@ -161,21 +204,32 @@ def extract_frames(tools: FFmpegTools, path: str, duration: float, count: int,
     return np.stack(frames).astype(np.float32)
 
 
-def extract_audio_segments(tools: FFmpegTools, path: str, duration: float, count: int = 12,
-                           cancel=None) -> list[np.ndarray]:
-    segments = []
-    seg = min(AUDIO_SEGMENT_SEC, duration) if duration > 0 else AUDIO_SEGMENT_SEC
+VOLUME_SEGMENT_SEC = 10.0
+_MAX_VOLUME = re.compile(r"max_volume:\s*(-?(?:inf|[0-9.]+))\s*dB")
+
+
+def parse_max_volume(stderr: str) -> float | None:
+    """volumedetect の出力から最大音量（dB）を読む。読めなければ None。"""
+    m = _MAX_VOLUME.search(stderr)
+    if not m:
+        return None
+    return float("-inf") if m.group(1) == "-inf" else float(m.group(1))
+
+
+def measure_max_volume(tools: FFmpegTools, path: str, duration: float, count: int = 3,
+                       cancel=None) -> list[float]:
+    """録画の中の数か所（各10秒）の最大音量を測る。全編は読み込まない。測れなかった区間は含めない。"""
+    seg = min(VOLUME_SEGMENT_SEC, duration) if duration > 0 else VOLUME_SEGMENT_SEC
+    values = []
     for t in _sample_times(max(duration - seg, 0.0), count if duration > seg * 2 else 1):
         if cancel is not None and cancel.is_set():
             raise Cancelled()
-        cp = _run([tools.ffmpeg, "-v", "error", "-ss", f"{t:.3f}", "-t", f"{seg:.3f}", "-i", path,
-                   "-vn", "-ac", "1", "-ar", str(AUDIO_RATE), "-f", "s16le", "-"], cancel, timeout=60)
-        if cp.returncode == 0 and len(cp.stdout) >= 2 * AUDIO_RATE // 10:
-            segments.append(np.frombuffer(cp.stdout[: len(cp.stdout) // 2 * 2], np.int16)
-                            .astype(np.float32) / 32768.0)
-    if not segments:
-        raise RuntimeError("音声を取り出せませんでした")
-    return segments
+        cp = _run([tools.ffmpeg, "-hide_banner", "-nostats", "-ss", f"{t:.3f}", "-t", f"{seg:.3f}", "-i", path,
+                   "-vn", "-af", "volumedetect", "-f", "null", "-"], cancel, timeout=60)
+        v = parse_max_volume(cp.stderr.decode("utf-8", "replace")) if cp.returncode == 0 else None
+        if v is not None:
+            values.append(v)
+    return values
 
 
 def make_thumbnails(tools: FFmpegTools, path: str, duration: float, out_prefix: Path,
@@ -225,91 +279,6 @@ def frame_features(frames: np.ndarray) -> dict:
     }
 
 
-def audio_features(segments: list[np.ndarray]) -> dict:
-    win = AUDIO_RATE // 20  # 50ms
-    rms_db, zcr, centroid, flatness, modulation = [], [], [], [], []
-    for x in segments:
-        n = len(x) // win
-        if n == 0:
-            continue
-        frames = x[: n * win].reshape(n, win)
-        rms = np.sqrt((frames ** 2).mean(axis=1) + 1e-12)
-        db = 20 * np.log10(rms + 1e-9)
-        rms_db.extend(db.tolist())
-        zcr.append(float((np.abs(np.diff(np.sign(frames), axis=1)) > 0).mean()))
-        spec = np.abs(np.fft.rfft(frames * np.hanning(win), axis=1)) + 1e-9
-        freqs = np.fft.rfftfreq(win, 1 / AUDIO_RATE)
-        centroid.append(float((spec * freqs).sum(axis=1).mean() / spec.sum(axis=1).mean()))
-        flatness.append(float((np.exp(np.log(spec).mean(axis=1)) / spec.mean(axis=1)).mean()))
-        modulation.append(float(np.std(np.diff(db))) if n > 2 else 0.0)
-    if not rms_db:
-        raise RuntimeError("音声が短すぎて解析できませんでした")
-    db = np.array(rms_db)
-    return {
-        "loudness_db": float(np.clip(db.mean(), -90, 0)),
-        "loudness_var": float(db.std()),
-        "silence_ratio": float((db < -45).mean()),
-        "zcr": float(np.mean(zcr)),
-        "spectral_centroid": float(np.mean(centroid)),
-        "spectral_flatness": float(np.mean(flatness)),
-        "modulation": float(np.mean(modulation)),
-    }
-
-
-def suggested_tags(meta: dict, features: dict) -> list[str]:
-    """測定値から判断できるタグだけを候補にする（意味の推定はしない）。"""
-    tags = []
-    video, audio = features.get("video"), features.get("audio")
-    if video and video["black_ratio"] >= 0.8:
-        tags.append("黒画面")
-    if video and video["static_ratio"] >= 0.7 and video["black_ratio"] < 0.8:
-        tags.append("静止画が多い")
-    if audio and audio["silence_ratio"] >= 0.5:
-        tags.append("無音区間が多い")
-    if meta.get("duration", 0) >= 2 * 3600:
-        tags.append("長時間")
-    return tags
-
-
-def analyze_video(tools: FFmpegTools, path: str, thumb_prefix: Path, max_frames: int = 40,
-                  cancel=None) -> tuple[str, str | None, dict, dict, list[str]]:
-    """1本を解析する。戻り値: (解析状態, エラー内容, meta, features, サムネイル)"""
-    before = file_state(path)
-    meta = probe(tools, path, cancel)
-    features: dict = {"video": None, "audio": None}
-    errors = []
-    thumbs: list[str] = []
-    duration = meta["duration"]
-    if meta["has_video"]:
-        try:
-            frames = extract_frames(tools, path, duration,
-                                    frame_count_for(duration, min(max_frames, MAX_FRAMES)), cancel)
-            features["video"] = frame_features(frames)
-            thumbs = make_thumbnails(tools, path, duration, thumb_prefix, cancel)
-        except (RuntimeError, TimeoutError) as e:
-            errors.append(f"映像: {e}")
-    else:
-        errors.append("映像: 映像トラックがありません")
-    if meta["has_audio"]:
-        try:
-            features["audio"] = audio_features(
-                extract_audio_segments(tools, path, duration, cancel=cancel))
-        except (RuntimeError, TimeoutError) as e:
-            errors.append(f"音声: {e}")
-    else:
-        errors.append("音声: 音声トラックがありません（解析失敗ではありません）")
-    ensure_unchanged(path, before)
-    has_any = features["video"] is not None or features["audio"] is not None
-    real_errors = [e for e in errors if "解析失敗ではありません" not in e]
-    if not has_any:
-        state = "失敗"
-    elif real_errors:
-        state = "一部失敗"
-    else:
-        state = "完了"
-    return state, " / ".join(errors) or None, meta, features, thumbs
-
-
 # --- ハッシュ ---------------------------------------------------------------
 def sha256_file(path: str, cancel=None, on_bytes: Callable[[int], None] | None = None,
                 chunk: int = 1024 * 1024) -> str:
@@ -327,91 +296,6 @@ def sha256_file(path: str, cancel=None, on_bytes: Callable[[int], None] | None =
                 on_bytes(len(data))
     ensure_unchanged(path, before)
     return h.hexdigest()
-
-
-# --- 圧縮 -------------------------------------------------------------------
-PRESETS = {
-    "画質優先": {"crf": 20, "preset": "medium", "audio": "160k", "max_height": None},
-    "バランス": {"crf": 24, "preset": "medium", "audio": "128k", "max_height": None},
-    "容量優先": {"crf": 28, "preset": "medium", "audio": "96k", "max_height": 1080},
-}
-
-
-def compressed_output_path(source: str, out_dir: str, preset: str) -> str:
-    stem = Path(source).stem
-    base = Path(out_dir) / f"{stem}_compressed_{preset}.mp4"
-    candidate, i = base, 2
-    while candidate.exists() or Path(str(candidate) + ".part").exists():
-        candidate = base.with_name(f"{base.stem}_{i}.mp4")
-        i += 1
-    return str(candidate)
-
-
-def compress(tools: FFmpegTools, source: str, output: str, preset: str, duration: float,
-             cancel: threading.Event, on_progress: Callable[[float | None], None]) -> dict:
-    """source を output に圧縮する。元ファイルは読むだけ。
-
-    一時ファイル（output + ".part"）に書き、検証に通ったら output に名前を変える。
-    失敗・キャンセル時は一時ファイルだけを消す。
-    """
-    if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(output)):
-        raise ValueError("出力先が元の動画と同じです")
-    if os.path.exists(output):
-        raise FileExistsError(f"出力ファイルが既に存在します: {output}")
-    p = PRESETS[preset]
-    temp = output + ".part"
-    vf = ["-vf", f"scale=-2:'min({p['max_height']},ih)'"] if p["max_height"] else []
-    args = [tools.ffmpeg, "-v", "error", "-n", "-i", source, *vf,
-            "-c:v", "libx264", "-crf", str(p["crf"]), "-preset", p["preset"],
-            "-c:a", "aac", "-b:a", p["audio"], "-movflags", "+faststart",
-            "-progress", "pipe:1", "-nostats", "-f", "mp4", temp]
-    before = file_state(source)
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW, text=True,
-                            encoding="utf-8", errors="replace")
-    err_lines: list[str] = []
-    err_thread = threading.Thread(target=lambda: err_lines.extend(proc.stderr), daemon=True)
-    err_thread.start()
-    try:
-        for line in proc.stdout:
-            if cancel.is_set():
-                proc.kill()
-                break
-            key, _, value = line.strip().partition("=")
-            if key == "out_time_us" and duration > 0:
-                try:
-                    on_progress(min(int(value) / 1e6 / duration, 1.0))
-                except ValueError:
-                    pass
-        proc.wait()
-        err_thread.join(5)
-        if cancel.is_set():
-            raise Cancelled()
-        if proc.returncode != 0:
-            raise RuntimeError("圧縮に失敗しました: " + "".join(err_lines).strip()[-300:])
-        ensure_unchanged(source, before)
-        # 出力の検証: 動画として読めて、長さがほぼ同じであること
-        out_meta = probe(tools, temp)
-        if not out_meta["has_video"] or (duration > 0 and abs(out_meta["duration"] - duration) >
-                                         max(2.0, duration * 0.02)):
-            raise RuntimeError("圧縮結果の検証に失敗しました（長さが一致しません）")
-        if os.path.exists(output):
-            raise FileExistsError(f"出力ファイルが既に存在します: {output}")
-        os.rename(temp, output)  # 既存ファイルがあれば Windows では失敗する（上書きしない）
-    except BaseException:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
-        if os.path.exists(temp):
-            os.remove(temp)  # アプリが作った一時ファイルだけを消す
-        raise
-    finally:
-        err_thread.join(5)
-        proc.stdout.close()
-        proc.stderr.close()
-    src_size, out_size = os.path.getsize(source), os.path.getsize(output)
-    return {"source_size": src_size, "output_size": out_size, "output": output,
-            "larger": out_size >= src_size}
 
 
 COMPARE_POINTS = (0.2, 0.4, 0.6, 0.8)

@@ -215,7 +215,7 @@ class CompareScopeAndUndoTest(unittest.TestCase):
         self.assertEqual(d[a], "残す")
         self.assertEqual(d[b], "削除候補")  # 比較中のもう1本だけ
         self.assertEqual([m for m in self.ids if d[m] == "削除候補"], [b])  # 確認していない録画は入れない
-        self.assertIn("ほかの 1 本を整理予定に追加しました", p.result_text.text())
+        self.assertIn("ほかの 1 本を削除候補に追加しました", p.result_text.text())
         self.assertIn("まだ移動していません", p.result_text.text())
         self.assertTrue(all(os.path.exists(self.s.video(m)["path"]) for m in self.ids))  # 比較ではファイルを動かさない
         p.undo()  # 取り消すと判断する前に戻る
@@ -231,7 +231,7 @@ class CompareScopeAndUndoTest(unittest.TestCase):
         p._keep_this(keep)
         d = self.decisions()
         self.assertEqual(sorted(m for m in self.ids if d[m] == "削除候補"), sorted(m for m in self.ids if m != keep))
-        self.assertIn("ほかの 3 本を整理予定に追加しました", p.result_text.text())
+        self.assertIn("ほかの 3 本を削除候補に追加しました", p.result_text.text())
 
     def test_hold_and_keep_pair_are_undoable(self):
         self.make("similar")

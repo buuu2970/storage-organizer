@@ -9,6 +9,11 @@
 | ハッシュ・動画解析などの結果 | analysis.jsonl | 追記のみ（巨大なファイルを毎回書き直さない）。壊れた行は読み飛ばし、大きくなったら起動時に整理する |
 | ごみ箱への移動の記録 | trash_log.jsonl | 追記のみ |
 
+保存は「一時ファイルに書く → 読み直して内容を確認 → 直前のファイルを .bak に残して置き換える」の順に行う。
+読み込めないときは壊れたファイルを退避し、.bak から復旧する。保護の記録を復旧できないときは整理操作を止める。
+保護・判断・確認日時の変更は、まとめて1回で保存する（選ぶたびに全体を書き直さない）。
+
+保存先は以前の版（RecSortAI・RecSort）とは別のフォルダにする（以前のデータを読み書きしない）。
 1つの Store を、画面と調査スレッドでロックを使って共有する。
 """
 
@@ -24,6 +29,8 @@ import threading
 import time
 from pathlib import Path
 
+SCHEMA_VERSION = 1  # 保存形式の版。新しい版で保存されたデータは、古いアプリでは変更しない
+DATA_DIR_NAME = "RecSortV1"
 ANALYSIS_STATES = ("未解析", "解析中", "完了", "一部失敗", "失敗")
 DECISIONS = ("残す", "削除候補", "保留", "両方残す")
 PATH_LIST_KEYS = ("extra_locations", "excluded_folders", "disabled_locations")
@@ -44,7 +51,7 @@ def default_data_dir() -> Path:
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     else:
         base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-    return base / "RecSort"
+    return base / DATA_DIR_NAME
 
 
 def loads(text, default=None):
@@ -211,23 +218,32 @@ def _load_json(path: Path, default, problems: list[str], pending_mark: Path | No
     return default, False
 
 
-def _write_raw(path: Path, data) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+def _write_tmp(tmp: Path, data) -> None:
+    """一時ファイルに書き、ディスクへ書き出してから読み直して、同じ内容になっているか確かめる。"""
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
+    try:
+        with open(tmp, encoding="utf-8") as f:
+            same = json.load(f) == json.loads(json.dumps(data, ensure_ascii=False))
+    except ValueError as e:
+        raise OSError(f"書き込んだ内容を確認できませんでした（{e}）") from e
+    if not same:
+        raise OSError("書き込んだ内容を読み直したところ、一致しませんでした")
+
+
+def _write_raw(path: Path, data) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    _write_tmp(tmp, data)
     os.replace(tmp, path)
 
 
 def _write_json(path: Path, data) -> None:
-    """一時ファイルに書いて置き換える。直前の正常なファイルは .bak として残す。失敗したら StoreError。"""
+    """一時ファイルに書いて確認してから置き換える。直前の正常なファイルは .bak として残す。失敗したら StoreError。"""
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
+        _write_tmp(tmp, data)
         if path.exists():
             os.replace(path, path.with_suffix(path.suffix + ".bak"))
         os.replace(tmp, path)
@@ -255,6 +271,8 @@ class Store:
         self._scan, _ = _load_json(self.data_dir / "scan_state.json", {}, self.load_problems)
         _clean_derived(self._scan, self.load_problems)
         self._sanitize_settings()
+        self._viewed_dirty = False  # 確認日時はまとめて保存する（選ぶたびに全体を書き直さない）
+        self._check_schema()
         self._scan.setdefault("locations", [])
         self._scan.setdefault("skips", [])
         self._scan.setdefault("stats", {})
@@ -355,7 +373,7 @@ class Store:
         return row
 
     SETTING_TYPES = {"ffmpeg_dir": (str,), "auto_scan_on_start": (str,), "scan_gen": (str, int),
-                     "scan_started": (str,), "scan_finished": (str,), "legacy_migrated": (str,),
+                     "scan_started": (str,), "scan_finished": (str,), "schema_version": (int,),
                      "files_scanned": (str,), "analysis_state": (str,),
                      "view_history_started": (str,), "extra_locations": (list,), "excluded_folders": (list,),
                      "disabled_locations": (list,), "not_scanned_drives": (list,)}
@@ -377,6 +395,20 @@ class Store:
                 self._settings.pop(key)
         if bad:
             self.load_problems.append(f"settings.json: 値の形式が正しくない設定（{', '.join(bad)}）を使わずに起動しました")
+
+    def _check_schema(self) -> None:
+        """保存形式の版を確認する。新しい版のアプリで保存されたデータは、内容を変えないよう整理操作を止める。"""
+        version = self._settings.get("schema_version")
+        if version is not None and version > SCHEMA_VERSION:
+            self.protection_ok = False
+            self.load_problems.append(f"settings.json: 新しい版のアプリ（保存形式 {version}）で保存されたデータです。"
+                                      "記録を壊さないよう、整理操作を止めています")
+            return
+        if version is None:
+            try:
+                self.set_setting("schema_version", SCHEMA_VERSION)
+            except StoreError as e:
+                self.load_problems.append(str(e))
 
     # --- 設定 -------------------------------------------------------------------
     def get_setting(self, key: str, default=None):
@@ -526,25 +558,44 @@ class Store:
 
     # --- 保護・判断 ---------------------------------------------------------------
     def _set_user(self, media_id: int, **fields) -> None:
+        self._set_user_many({media_id: fields})
+
+    def _set_user_many(self, changes: dict[int, dict]) -> None:
+        """複数のファイルの保護・判断をまとめて保存する（ファイル全体の書き直しは1回だけ）。"""
         with self.lock:
             if not self.protection_ok:
                 raise StoreError("保護・判断の記録を読み込めなかったため、変更できません（設定画面で対処できます）")
-            row = self._rows[media_id]
             new = dict(self._user)
-            entry = dict(new.get(row["path"], {}))
-            for k, v in fields.items():
-                if v in (None, 0, False):
-                    entry.pop(k, None)
+            for media_id, fields in changes.items():
+                row = self._rows[media_id]
+                entry = dict(new.get(row["path"], {}))
+                for k, v in fields.items():
+                    if v in (None, 0, False):
+                        entry.pop(k, None)
+                    else:
+                        entry[k] = v
+                if entry:
+                    new[row["path"]] = entry
                 else:
-                    entry[k] = v
-            if entry:
-                new[row["path"]] = entry
-            else:
-                new.pop(row["path"], None)
+                    new.pop(row["path"], None)
             _write_json(self.data_dir / "user_state.json", new)  # 書けてから画面上の状態を変える
             self._user = new
-            for k, v in fields.items():
-                row[k] = int(bool(v)) if k in ("protected", "favorite") else v
+            self._viewed_dirty = False  # まとめて保存していた確認日時も、いま一緒に書けた
+            for media_id, fields in changes.items():
+                row = self._rows[media_id]
+                for k, v in fields.items():
+                    row[k] = int(bool(v)) if k in ("protected", "favorite") else v
+
+    def flush_user_state(self) -> None:
+        """まとめて保存していない確認日時を書き出す（終了時など）。失敗しても判断の記録は失わない。"""
+        with self.lock:
+            if not self._viewed_dirty or not self.protection_ok:
+                return
+            try:
+                _write_json(self.data_dir / "user_state.json", self._user)
+                self._viewed_dirty = False
+            except StoreError:
+                pass
 
     def reset_user_state(self) -> None:
         """読み込めなかった保護・判断の記録を、利用者の明示の操作で初期化する（壊れたファイルは退避済み）。"""
@@ -561,31 +612,32 @@ class Store:
             for r in self._rows.values():
                 r.update(protected=0, decision=None, favorite=0, last_viewed=None)
 
-    def import_user_state(self, entries: dict[str, dict]) -> None:
-        """以前の版から保護・判断を取り込む（すでにある判断は上書きしない）。"""
-        with self.lock:
-            if not self.protection_ok:
-                raise StoreError("保護・判断の記録を読み込めなかったため、取り込めません")
-            new = {p: dict(e) for p, e in self._user.items()}
-            for path, entry in entries.items():
-                cur = new.setdefault(path, {})
-                for k, v in entry.items():
-                    cur.setdefault(k, v)
-            _write_json(self.data_dir / "user_state.json", new)
-            self._user = new
-            for path, cur in new.items():
-                rid = self._by_path.get(path)
-                if rid is not None:
-                    row = self._rows[rid]
-                    for k, v in cur.items():
-                        row[k] = int(bool(v)) if k in ("protected", "favorite") else v
-
     def set_decision(self, media_id: int, decision: str | None) -> None:
         if decision is not None and decision not in DECISIONS:
             raise ValueError(decision)
         if decision == "削除候補" and self.video(media_id)["protected"]:
             raise PermissionError("保護したファイルは削除候補にできません")
         self._set_user(media_id, decision=decision)
+
+    def set_decisions(self, media_ids, decision: str | None) -> list[int]:
+        """まとめて判断を記録する（保存は1回）。保護中で削除候補にできなかった ID を返す。"""
+        if decision is not None and decision not in DECISIONS:
+            raise ValueError(decision)
+        refused = []
+        changes = {}
+        with self.lock:
+            for mid in dict.fromkeys(media_ids):
+                row = self._rows.get(mid)
+                if row is None:
+                    continue
+                if decision == "削除候補" and row["protected"]:
+                    refused.append(mid)
+                    continue
+                if row["decision"] != decision:
+                    changes[mid] = {"decision": decision}
+            if changes:
+                self._set_user_many(changes)
+        return refused
 
     def set_protected(self, media_id: int, value: bool) -> None:
         """保護する。付けると削除候補から外す。"""
@@ -595,6 +647,14 @@ class Store:
         else:
             self._set_user(media_id, protected=bool(value))
 
+    def set_favorite(self, media_id: int, value: bool) -> None:
+        """お気に入りにする（保護とは別の状態）。お気に入りは「残す」に近い扱いで、削除候補からも外す。"""
+        row = self.video(media_id)
+        if value and row["decision"] == "削除候補":
+            self._set_user(media_id, favorite=True, decision=None)
+        else:
+            self._set_user(media_id, favorite=bool(value))
+
     def mark_viewed(self, media_id: int) -> None:
         """このアプリで確認した日時を記録する（利用者の判断ではないので、記録できなくても表示は続ける）。"""
         if not self.protection_ok:
@@ -602,9 +662,16 @@ class Store:
         try:
             if self.get_setting("view_history_started") is None:
                 self.set_setting("view_history_started", str(time.time()))
-            self._set_user(media_id, last_viewed=time.time())
         except StoreError:
-            pass
+            return
+        with self.lock:  # 判断ではないので、ここでは書き込まず、次の保存（判断・終了時）にまとめて書く
+            row = self._rows[media_id]
+            now = time.time()
+            entry = dict(self._user.get(row["path"], {}))
+            entry["last_viewed"] = now
+            self._user = {**self._user, row["path"]: entry}
+            row["last_viewed"] = now
+            self._viewed_dirty = True
 
     def mark_trashed(self, media_id: int) -> None:
         with self.lock:
@@ -724,4 +791,5 @@ class Store:
 
     def close(self) -> None:
         with self.lock:
+            self.flush_user_state()
             self.save_scan_state()
