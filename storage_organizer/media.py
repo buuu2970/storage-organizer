@@ -2,7 +2,8 @@
 
 安全上の方針:
 - 元の動画は読み取るだけで、変更・上書き・削除しない
-- 書き込むのはアプリのキャッシュ（サムネイル・比較用の場面）だけ
+- 書き込むのはアプリのキャッシュ（サムネイル・比較用の場面）と、利用者が圧縮を実行したときの新しいファイルだけ
+  （圧縮は別ファイルに出力し、元の動画は変更・削除しない）
 - FFmpeg は探すだけで、自動でインストールしない
 - クラウド上のみのファイルは中身を読まない（勝手にダウンロードさせない）
 - 読み取りの前後でファイル状態を比べ、途中で変わったら結果を使わない
@@ -296,6 +297,91 @@ def sha256_file(path: str, cancel=None, on_bytes: Callable[[int], None] | None =
                 on_bytes(len(data))
     ensure_unchanged(path, before)
     return h.hexdigest()
+
+
+# --- 圧縮 -------------------------------------------------------------------
+PRESETS = {
+    "画質優先": {"crf": 20, "preset": "medium", "audio": "160k", "max_height": None},
+    "バランス": {"crf": 24, "preset": "medium", "audio": "128k", "max_height": None},
+    "容量優先": {"crf": 28, "preset": "medium", "audio": "96k", "max_height": 1080},
+}
+
+
+def compressed_output_path(source: str, out_dir: str, preset: str) -> str:
+    stem = Path(source).stem
+    base = Path(out_dir) / f"{stem}_compressed_{preset}.mp4"
+    candidate, i = base, 2
+    while candidate.exists() or Path(str(candidate) + ".part").exists():
+        candidate = base.with_name(f"{base.stem}_{i}.mp4")
+        i += 1
+    return str(candidate)
+
+
+def compress(tools: FFmpegTools, source: str, output: str, preset: str, duration: float,
+             cancel: threading.Event, on_progress: Callable[[float | None], None]) -> dict:
+    """source を output に圧縮する。元ファイルは読むだけ。
+
+    一時ファイル（output + ".part"）に書き、検証に通ったら output に名前を変える。
+    失敗・キャンセル時は一時ファイルだけを消す。
+    """
+    if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(output)):
+        raise ValueError("出力先が元の動画と同じです")
+    if os.path.exists(output):
+        raise FileExistsError(f"出力ファイルが既に存在します: {output}")
+    p = PRESETS[preset]
+    temp = output + ".part"
+    vf = ["-vf", f"scale=-2:'min({p['max_height']},ih)'"] if p["max_height"] else []
+    args = [tools.ffmpeg, "-v", "error", "-n", "-i", source, *vf,
+            "-c:v", "libx264", "-crf", str(p["crf"]), "-preset", p["preset"],
+            "-c:a", "aac", "-b:a", p["audio"], "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats", "-f", "mp4", temp]
+    before = file_state(source)
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, creationflags=_NO_WINDOW, text=True,
+                            encoding="utf-8", errors="replace")
+    err_lines: list[str] = []
+    err_thread = threading.Thread(target=lambda: err_lines.extend(proc.stderr), daemon=True)
+    err_thread.start()
+    try:
+        for line in proc.stdout:
+            if cancel.is_set():
+                proc.kill()
+                break
+            key, _, value = line.strip().partition("=")
+            if key == "out_time_us" and duration > 0:
+                try:
+                    on_progress(min(int(value) / 1e6 / duration, 1.0))
+                except ValueError:
+                    pass
+        proc.wait()
+        err_thread.join(5)
+        if cancel.is_set():
+            raise Cancelled()
+        if proc.returncode != 0:
+            raise RuntimeError("圧縮に失敗しました: " + "".join(err_lines).strip()[-300:])
+        ensure_unchanged(source, before)
+        # 出力の検証: 動画として読めて、長さがほぼ同じであること
+        out_meta = probe(tools, temp)
+        if not out_meta["has_video"] or (duration > 0 and abs(out_meta["duration"] - duration) >
+                                         max(2.0, duration * 0.02)):
+            raise RuntimeError("圧縮結果の検証に失敗しました（長さが一致しません）")
+        if os.path.exists(output):
+            raise FileExistsError(f"出力ファイルが既に存在します: {output}")
+        os.rename(temp, output)  # 既存ファイルがあれば Windows では失敗する（上書きしない）
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if os.path.exists(temp):
+            os.remove(temp)  # アプリが作った一時ファイルだけを消す
+        raise
+    finally:
+        err_thread.join(5)
+        proc.stdout.close()
+        proc.stderr.close()
+    src_size, out_size = os.path.getsize(source), os.path.getsize(output)
+    return {"source_size": src_size, "output_size": out_size, "output": output,
+            "larger": out_size >= src_size}
 
 
 COMPARE_POINTS = (0.2, 0.4, 0.6, 0.8)

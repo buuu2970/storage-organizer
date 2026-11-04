@@ -1,7 +1,8 @@
 """見た目の設定（色・余白・角丸・文字・アイコン）を1か所にまとめる。
 
-Windows 11 になじむ落ち着いたライトテーマ。各画面では個別のスタイルを書かず、
-ここで定義した QSS と、ウィジェットのプロパティ（kind / role）で見た目を切り替える。
+初心者に優しいモダンダークテーマ（チャコールの背景・少し明るいサイドバーとカード・青紫のアクセント）。
+派手さより読みやすさを優先し、状態は色だけでなくアイコンと文言でも示す。
+各画面では個別のスタイルを書かず、ここで定義した QSS と、ウィジェットのプロパティ（kind / role）で切り替える。
 """
 
 from __future__ import annotations
@@ -10,22 +11,27 @@ from PySide6.QtCore import QByteArray, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 
 # --- 色 ---------------------------------------------------------------------
-BG = "#F3F3F3"          # 画面の背景（薄いグレー）
-SURFACE = "#FFFFFF"     # カード・パネル
-SURFACE_ALT = "#F9F9F9"
-BORDER = "#E0E0E0"      # 薄い境界線
-BORDER_STRONG = "#C8C8C8"
-TEXT = "#1B1B1B"        # 本文
-TEXT_SUB = "#5C5C5C"    # 補足（薄すぎない濃さ）
-ACCENT = "#0067C0"      # アクセント（青系1色）
-ACCENT_HOVER = "#1975C5"
-ACCENT_PRESSED = "#005BA9"
-ACCENT_SOFT = "#E5F0FA"  # 選択中の背景
-FOCUS = "#000000"
-DANGER = "#C42B1C"      # ごみ箱への移動など、実際に破壊的な操作だけに使う
-DANGER_HOVER = "#B02719"
-WARN = "#9D5D00"        # 注意（文字色。色だけに頼らずアイコン・文言も添える）
-OK = "#0F7B0F"
+BG = "#1E1F22"          # 画面の背景（チャコールブラック）
+SIDEBAR = "#25262B"     # サイドバー（背景より少し明るい）
+SURFACE = "#2B2D33"     # カード・パネル（ダークグレー）
+SURFACE_ALT = "#32343B"  # 一覧の交互の行・ホバー
+SURFACE_HIGH = "#3A3D45"  # 押したとき・入力欄
+BORDER = "#3B3E46"      # 薄い境界線
+BORDER_STRONG = "#555965"
+TEXT = "#F1F2F5"        # 本文（白に近い）
+TEXT_SUB = "#B5B9C4"    # 補足（読みやすいグレー）
+TEXT_DISABLED = "#7D818C"
+ACCENT = "#6B5CE7"      # アクセント（青紫）。白い文字を載せても読める濃さ
+ACCENT_HOVER = "#7A6CF0"
+ACCENT_PRESSED = "#5A4BD4"
+ACCENT_SOFT = "#3A3570"  # 選択中の背景
+ACCENT_TEXT = "#B3A9FF"  # 暗い背景の上のリンク・強調文字
+FOCUS = "#D2CCFF"
+DANGER = "#D9443A"      # 赤: ごみ箱への移動など、実際に取り消しにくい操作とエラーだけに使う
+DANGER_HOVER = "#E5574D"
+WARN = "#F0B429"        # アンバー: 注意（色だけに頼らずアイコン・文言も添える）
+OK = "#4CB782"          # 落ち着いた緑: 成功・残す
+THUMB_BG = "#17181B"    # サムネイルの下地
 
 # --- 寸法（8px 単位） -----------------------------------------------------------
 S1, S2, S3, S4 = 8, 16, 24, 32
@@ -34,7 +40,7 @@ RADIUS_L = 12
 
 # --- 文字 ---------------------------------------------------------------------
 FONT_FAMILIES = ["Yu Gothic UI", "Meiryo UI", "Segoe UI", "Noto Sans CJK JP", "Noto Sans JP", "sans-serif"]
-SIZE_CAPTION, SIZE_BODY, SIZE_SUBTITLE, SIZE_TITLE, SIZE_DISPLAY = 9, 10, 12, 16, 22
+SIZE_CAPTION, SIZE_BODY, SIZE_SUBTITLE, SIZE_TITLE, SIZE_DISPLAY, SIZE_HERO = 9, 10, 12, 17, 24, 22
 
 
 def font(size: int = SIZE_BODY, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
@@ -52,44 +58,56 @@ def qss() -> str:
 QMainWindow, QDialog {{ background: {BG}; }}
 QWidget#Page {{ background: {BG}; }}
 QLabel {{ background: transparent; }}
+QLabel[role="hero"] {{ font-size: {SIZE_HERO}pt; font-weight: 700; }}
 QLabel[role="title"] {{ font-size: {SIZE_TITLE}pt; font-weight: 600; }}
 QLabel[role="display"] {{ font-size: {SIZE_DISPLAY}pt; font-weight: 600; }}
 QLabel[role="subtitle"] {{ font-size: {SIZE_SUBTITLE}pt; font-weight: 600; }}
 QLabel[role="caption"] {{ font-size: {SIZE_CAPTION}pt; color: {TEXT_SUB}; }}
 QLabel[role="sub"] {{ color: {TEXT_SUB}; }}
 QLabel[role="warn"] {{ color: {WARN}; }}
+QLabel[role="ok"] {{ color: {OK}; }}
+QLabel[role="accent"] {{ color: {ACCENT_TEXT}; font-weight: 600; }}
 QLabel[role="danger"] {{ color: {DANGER}; }}
 
 QFrame#Card, QWidget#Card {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: {RADIUS_L}px; }}
 QFrame#DetailPanel {{ background: transparent; border: none; }}
 QFrame#Panel, QWidget#Panel {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: {RADIUS}px; }}
-QFrame#SelectionBar {{ background: {ACCENT_SOFT}; border: 1px solid #B9D5EE; border-radius: {RADIUS}px; }}
+QFrame#SelectionBar {{ background: {ACCENT_SOFT}; border: 1px solid {ACCENT}; border-radius: {RADIUS}px; }}
+QFrame#Hint {{ background: {SURFACE}; border: 1px solid {ACCENT}; border-radius: {RADIUS}px; }}
+QWidget#Sidebar {{ background: {SIDEBAR}; border-right: 1px solid {BORDER}; }}
+QWidget#TopBar {{ background: {SIDEBAR}; border-bottom: 1px solid {BORDER}; }}
 QFrame#Divider {{ background: {BORDER}; max-height: 1px; min-height: 1px; border: none; }}
 
 QPushButton, QToolButton {{
     background: {SURFACE}; border: 1px solid {BORDER_STRONG}; border-radius: {RADIUS - 2}px;
     padding: 5px 14px; min-height: 22px;
 }}
-QPushButton:hover, QToolButton:hover {{ background: {SURFACE_ALT}; border-color: #B0B0B0; }}
-QPushButton:pressed, QToolButton:pressed {{ background: #EDEDED; }}
+QPushButton:hover, QToolButton:hover {{ background: {SURFACE_ALT}; border-color: {TEXT_DISABLED}; }}
+QPushButton:pressed, QToolButton:pressed {{ background: {SURFACE_HIGH}; }}
 QPushButton:focus, QToolButton:focus {{ border: 2px solid {FOCUS}; padding: 4px 13px; }}
-QPushButton:disabled, QToolButton:disabled {{ color: #8A8A8A; background: #F5F5F5; border-color: {BORDER}; }}
+QPushButton:disabled, QToolButton:disabled {{ color: {TEXT_DISABLED}; background: {SURFACE}; border-color: {BORDER}; }}
 QPushButton[kind="primary"] {{ background: {ACCENT}; color: white; border: 1px solid {ACCENT_PRESSED}; font-weight: 600; }}
 QPushButton[kind="primary"]:hover {{ background: {ACCENT_HOVER}; }}
 QPushButton[kind="primary"]:pressed {{ background: {ACCENT_PRESSED}; }}
-QPushButton[kind="primary"]:disabled {{ background: #9DBFE0; color: #F0F0F0; }}
-QPushButton[kind="danger"] {{ background: {DANGER}; color: white; border: 1px solid #A32416; font-weight: 600; }}
+QPushButton[kind="primary"]:disabled {{ background: #3E3A66; color: {TEXT_DISABLED}; }}
+QPushButton[kind="danger"] {{ background: {DANGER}; color: white; border: 1px solid #B5352C; font-weight: 600; }}
 QPushButton[kind="danger"]:hover {{ background: {DANGER_HOVER}; }}
-QPushButton[kind="danger"]:disabled {{ background: #E4AAA4; color: #FBEFEE; }}
+QPushButton[kind="danger"]:disabled {{ background: #5A2E2B; color: {TEXT_DISABLED}; }}
 QPushButton[kind="subtle"], QToolButton[kind="subtle"] {{ background: transparent; border: 1px solid transparent; }}
-QPushButton[kind="subtle"]:hover, QToolButton[kind="subtle"]:hover {{ background: #EAEAEA; }}
-QPushButton[kind="link"] {{ background: transparent; border: none; color: {ACCENT}; padding: 2px 4px; }}
+QPushButton[kind="subtle"]:hover, QToolButton[kind="subtle"]:hover {{ background: {SURFACE_ALT}; }}
+QPushButton[kind="big"] {{ font-size: {SIZE_SUBTITLE}pt; font-weight: 600; padding: 10px 20px; min-height: 30px; }}
+QPushButton[kind="keep"] {{ background: #1F3A2D; border: 1px solid {OK}; font-size: {SIZE_SUBTITLE}pt; font-weight: 600; padding: 10px 20px; min-height: 30px; }}
+QPushButton[kind="keep"]:hover {{ background: #264A39; }}
+QPushButton[kind="review"] {{ background: #43361A; border: 1px solid {WARN}; font-size: {SIZE_SUBTITLE}pt; font-weight: 600; padding: 10px 20px; min-height: 30px; }}
+QPushButton[kind="review"]:hover {{ background: #54441F; }}
+QPushButton[kind="hold"] {{ background: {SURFACE_ALT}; border: 1px solid {BORDER_STRONG}; font-size: {SIZE_SUBTITLE}pt; font-weight: 600; padding: 10px 20px; min-height: 30px; }}
+QPushButton[kind="link"] {{ background: transparent; border: none; color: {ACCENT_TEXT}; padding: 2px 4px; }}
 QPushButton[kind="link"]:hover {{ text-decoration: underline; }}
-QPushButton[kind="link"]:disabled {{ color: #8A8A8A; background: transparent; }}
+QPushButton[kind="link"]:disabled {{ color: {TEXT_DISABLED}; background: transparent; }}
 QToolButton::menu-indicator {{ image: none; width: 0; }}
 
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
-    background: {SURFACE}; border: 1px solid {BORDER_STRONG}; border-bottom: 1px solid #8A8A8A;
+    background: {SURFACE_HIGH}; border: 1px solid {BORDER_STRONG}; border-bottom: 1px solid {TEXT_DISABLED};
     border-radius: {RADIUS - 2}px; padding: 4px 8px; min-height: 22px;
 }}
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border-bottom: 2px solid {ACCENT}; }}
@@ -99,8 +117,8 @@ QComboBox QAbstractItemView {{ background: {SURFACE}; border: 1px solid {BORDER}
 
 QListWidget#Nav {{ background: transparent; border: none; outline: none; }}
 QListWidget#Nav::item {{ padding: 8px 10px; margin: 2px 4px; border-radius: {RADIUS - 2}px; color: {TEXT}; }}
-QListWidget#Nav::item:hover {{ background: #E9E9E9; }}
-QListWidget#Nav::item:selected {{ background: {SURFACE}; color: {TEXT}; font-weight: 600; border-left: 3px solid {ACCENT}; }}
+QListWidget#Nav::item:hover {{ background: {SURFACE_ALT}; }}
+QListWidget#Nav::item:selected {{ background: {ACCENT_SOFT}; color: {TEXT}; font-weight: 600; border-left: 3px solid {ACCENT_TEXT}; }}
 
 QListView, QTableView, QTreeView, QTreeWidget, QListWidget, QTableWidget {{
     background: {SURFACE}; border: 1px solid {BORDER}; border-radius: {RADIUS}px; outline: none;
@@ -124,14 +142,14 @@ QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color
 QScrollArea {{ background: transparent; border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
 QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
-QScrollBar::handle {{ background: #C2C2C2; border-radius: 3px; min-height: 24px; min-width: 24px; }}
-QScrollBar::handle:hover {{ background: #9E9E9E; }}
+QScrollBar::handle {{ background: {BORDER_STRONG}; border-radius: 3px; min-height: 24px; min-width: 24px; }}
+QScrollBar::handle:hover {{ background: {TEXT_DISABLED}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}
-QStatusBar {{ background: {SURFACE}; border-top: 1px solid {BORDER}; }}
+QStatusBar {{ background: {SIDEBAR}; border-top: 1px solid {BORDER}; }}
 QStatusBar::item {{ border: none; }}
-QProgressBar {{ background: #E6E6E6; border: none; border-radius: 3px; max-height: 6px; min-height: 6px; text-align: center; }}
+QProgressBar {{ background: {SURFACE_HIGH}; border: none; border-radius: 3px; max-height: 6px; min-height: 6px; text-align: center; }}
 QProgressBar::chunk {{ background: {ACCENT}; border-radius: 3px; }}
 QSplitter::handle {{ background: transparent; width: 8px; }}
 QMenu {{ background: {SURFACE}; border: 1px solid {BORDER}; padding: 4px; }}
@@ -139,6 +157,9 @@ QMenu::item {{ padding: 6px 24px 6px 12px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {ACCENT_SOFT}; color: {TEXT}; }}
 QToolTip {{ background: {SURFACE}; color: {TEXT}; border: 1px solid {BORDER_STRONG}; padding: 4px; }}
 QCheckBox, QRadioButton {{ spacing: 8px; }}
+QSlider::groove:horizontal {{ background: {SURFACE_HIGH}; height: 6px; border-radius: 3px; }}
+QSlider::handle:horizontal {{ background: {ACCENT_TEXT}; width: 14px; margin: -5px 0; border-radius: 7px; }}
+QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 3px; }}
 """
 
 

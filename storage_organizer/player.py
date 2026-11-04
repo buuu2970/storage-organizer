@@ -8,6 +8,8 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget
 
+from . import theme
+
 
 class VideoPlayer(QWidget):
     """Qt Multimedia による再生・停止・シーク。
@@ -22,7 +24,7 @@ class VideoPlayer(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.error_label = QLabel()
-        self.error_label.setStyleSheet("color: #b00020;")
+        self.error_label.setStyleSheet(f"color: {theme.WARN};")
         self.error_label.setWordWrap(True)
         self.screen = QStackedWidget()
         self.screen.setMinimumSize(240, 135)

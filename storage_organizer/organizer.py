@@ -339,7 +339,7 @@ class CardDelegate(QStyledItemDelegate):
         hover = bool(option.state & QStyle.StateFlag.State_MouseOver)
         focus = bool(option.state & QStyle.StateFlag.State_HasFocus)
         # カード（選択・ホバー・フォーカスを区別する）
-        painter.setPen(QPen(QColor(theme.ACCENT if selected else ("#B0B0B0" if hover else theme.BORDER)),
+        painter.setPen(QPen(QColor(theme.ACCENT_TEXT if selected else (theme.BORDER_STRONG if hover else theme.BORDER)),
                             2 if selected else 1))
         painter.setBrush(QColor(theme.ACCENT_SOFT if selected else theme.SURFACE))
         painter.drawRoundedRect(rect, theme.RADIUS, theme.RADIUS)
@@ -351,7 +351,7 @@ class CardDelegate(QStyledItemDelegate):
         # サムネイル（縦横比を保ち、引き伸ばさない）
         thumb = QRectF(rect.left() + 8, rect.top() + 8, rect.width() - 16, THUMB_H)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#EFEFEF"))
+        painter.setBrush(QColor(theme.THUMB_BG))
         painter.drawRoundedRect(thumb, 6, 6)
         pm = self.loader.pixmap(it)
         if pm is not None and not pm.isNull():
@@ -1734,7 +1734,7 @@ class HomePage(QWidget):
             thumb = QLabel()
             thumb.setFixedSize(112, 63)
             thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb.setStyleSheet("background: #1f1f1f; color: #f0f0f0; border-radius: 6px;")
+            thumb.setStyleSheet(f"background: {theme.THUMB_BG}; color: {theme.TEXT_SUB}; border-radius: 6px;")
             pm = self.state.loader.pixmap(row_dict(ctx.rows[keep], ctx))
             if pm is not None and not pm.isNull():
                 thumb.setPixmap(pm.scaled(112, 63, Qt.AspectRatioMode.KeepAspectRatio,
