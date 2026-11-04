@@ -8,7 +8,7 @@ Windows PC を調べて、何が容量を使っているかを示し、特に **
 - データベースは使いません（設定・保護・判断は JSON）
 - 個人の録画やファイル情報を外部へ送信しません
 
-バージョン: 0.9.0rc2（リリース候補）。配布手順は `DISTRIBUTION.md`、ライセンスは `THIRD_PARTY_NOTICES.md`、作業記録は `RELEASE_CHECKLIST.md`。
+バージョン: 0.9.0rc3（リリース候補）。配布手順は `DISTRIBUTION.md`、ライセンスは `THIRD_PARTY_NOTICES.md`、作業記録は `RELEASE_CHECKLIST.md`。
 
 ## 使い方（ホーム → 候補を確認 → 比較して選ぶ → 最終確認 → 結果）
 

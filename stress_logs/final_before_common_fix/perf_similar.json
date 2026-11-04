@@ -1,0 +1,130 @@
+{
+ "limits": {
+  "seconds_total_1000": 60.0,
+  "python_peak_mb": 200.0,
+  "process_maxrss_mb": 1024.0,
+  "cancel_seconds": 2.0
+ },
+ "runs": [
+  {
+   "videos": 110,
+   "kind": "distinct",
+   "window_pairs": 5995,
+   "detailed_pairs": 12,
+   "similar_pairs": 10,
+   "seconds_total": 0.44,
+   "seconds_by_stage": {
+    "prepare": 0.37,
+    "compare": 0.07,
+    "group": 0.0
+   },
+   "python_peak_mb": 0.4,
+   "planted": 10,
+   "detected": 10,
+   "groups": 10,
+   "largest_group": 2
+  },
+  {
+   "videos": 1020,
+   "kind": "distinct",
+   "window_pairs": 519690,
+   "detailed_pairs": 174,
+   "similar_pairs": 20,
+   "seconds_total": 3.55,
+   "seconds_by_stage": {
+    "prepare": 2.63,
+    "compare": 0.92,
+    "group": 0.0
+   },
+   "python_peak_mb": 2.6,
+   "planted": 20,
+   "detected": 20,
+   "groups": 20,
+   "largest_group": 2
+  },
+  {
+   "videos": 110,
+   "kind": "similar_heavy",
+   "window_pairs": 5995,
+   "detailed_pairs": 509,
+   "similar_pairs": 10,
+   "seconds_total": 2.35,
+   "seconds_by_stage": {
+    "prepare": 0.28,
+    "compare": 2.07,
+    "group": 0.0
+   },
+   "python_peak_mb": 0.4,
+   "planted": 10,
+   "detected": 10,
+   "groups": 10,
+   "largest_group": 2
+  },
+  {
+   "videos": 1020,
+   "kind": "similar_heavy",
+   "window_pairs": 519690,
+   "detailed_pairs": 38606,
+   "similar_pairs": 20,
+   "seconds_total": 159.5,
+   "seconds_by_stage": {
+    "prepare": 2.48,
+    "compare": 157.02,
+    "group": 0.0
+   },
+   "python_peak_mb": 2.6,
+   "planted": 20,
+   "detected": 20,
+   "groups": 20,
+   "largest_group": 2
+  }
+ ],
+ "cancel": [
+  {
+   "videos": 1020,
+   "kind": "distinct",
+   "stage": "prepare",
+   "result": "キャンセルされた",
+   "seconds_after_cancel": 0.101
+  },
+  {
+   "videos": 1020,
+   "kind": "distinct",
+   "stage": "compare",
+   "result": "キャンセルされた",
+   "seconds_after_cancel": 0.01
+  },
+  {
+   "videos": 1020,
+   "kind": "distinct",
+   "stage": "group",
+   "result": "キャンセルされた",
+   "seconds_after_cancel": 0.0
+  },
+  {
+   "videos": 1020,
+   "kind": "similar_heavy",
+   "stage": "prepare",
+   "result": "キャンセルされた",
+   "seconds_after_cancel": 0.1
+  },
+  {
+   "videos": 1020,
+   "kind": "similar_heavy",
+   "stage": "compare",
+   "result": "キャンセルされた",
+   "seconds_after_cancel": 0.925
+  },
+  {
+   "videos": 1020,
+   "kind": "similar_heavy",
+   "stage": "group",
+   "result": "キャンセルされた",
+   "seconds_after_cancel": 0.0
+  }
+ ],
+ "violations": [
+  "similar_heavy 1000本: 159.5 秒（上限 60.0）"
+ ],
+ "process_maxrss_mb": 52.4
+}

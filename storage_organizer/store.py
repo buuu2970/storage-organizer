@@ -18,6 +18,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -57,28 +58,181 @@ def loads(text, default=None):
         return default
 
 
-def _read_json(path: Path, default):
+class StoreError(Exception):
+    """保存に失敗した、または安全のため変更できない（画面には成功と表示しない）。"""
+
+
+def _is_int_text(v) -> bool:
+    """半角の 0〜9 だけからなる文字列か（"²" などは isdigit() でも int() できないため使わない）。"""
+    return isinstance(v, str) and re.fullmatch(r"[0-9]+", v) is not None
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _check_settings(d) -> str | None:
+    if not isinstance(d, dict):
+        return "形式が正しくありません（設定の一覧ではありません）"
+    if not all(isinstance(k, str) for k in d):
+        return "形式が正しくありません（項目名）"
+    return None
+
+
+def _check_user_state(d) -> str | None:
+    if not isinstance(d, dict):
+        return "形式が正しくありません（保護・判断の一覧ではありません）"
+    for path, e in d.items():
+        if not isinstance(path, str) or not isinstance(e, dict):
+            return "形式が正しくありません（ファイルごとの記録）"
+        for k, v in e.items():
+            if k in ("protected", "favorite") and not isinstance(v, (bool, int)):
+                return f"形式が正しくありません（{k} の値）"
+            if k == "decision" and v not in DECISIONS:
+                return "形式が正しくありません（判断の値）"
+            if k == "last_viewed" and v is not None and not _is_num(v):
+                return "形式が正しくありません（確認日時）"
+            if k not in ("protected", "favorite", "decision", "last_viewed"):
+                return f"形式が正しくありません（不明な項目 {k}）"
+    return None
+
+
+def _check_scan_state(d) -> str | None:
+    """調査状態の中心（調査場所・スキップ）を検証する。派生キャッシュは _clean_derived で個別に扱う。"""
+    if not isinstance(d, dict):
+        return "形式が正しくありません（調査状態ではありません）"
+    for key, typ in (("locations", list), ("skips", list)):
+        if key in d and not isinstance(d[key], typ):
+            return f"形式が正しくありません（{key}）"
+    for x in d.get("locations", []):
+        if not isinstance(x, dict) or not isinstance(x.get("path"), str) or not _is_num(x.get("priority", 0)):
+            return "形式が正しくありません（調査場所）"
+    for x in d.get("skips", []):
+        if not isinstance(x, dict) or not all(isinstance(x.get(k), str) for k in ("path", "location", "reason", "kind")):
+            return "形式が正しくありません（スキップした場所）"
+    return None
+
+
+def _clean_derived(d: dict, problems: list[str]) -> None:
+    """派生キャッシュ（容量の集計・類似グループ）は、不正なら捨てる（次の調査・解析で作り直す）。"""
+    def bad(key, what):
+        d.pop(key, None)
+        problems.append(f"scan_state.json: {what}の形式が正しくないため捨てました（次の調査で作り直します）")
+    vg = d.get("video_groups", [])
+    if not (isinstance(vg, list) and all(isinstance(g, list) and all(isinstance(p, str) for p in g) for g in vg)):
+        bad("video_groups", "類似録画のグループ")
+    sg = d.get("similar_groups", {})
+    if not (isinstance(sg, dict) and all(_is_int_text(k) and isinstance(v, list)
+                                         and all(isinstance(p, str) for p in v) for k, v in sg.items())):
+        bad("similar_groups", "類似画像のグループ")
+    pair = lambda v: isinstance(v, list) and len(v) == 2 and all(_is_num(x) for x in v)  # noqa: E731
+    triple = lambda v: isinstance(v, list) and len(v) == 3 and _is_num(v[0]) and isinstance(v[1], str)  # noqa: E731
+    stats = d.get("stats", {})
+    ok = isinstance(stats, dict)
+    for st in (stats.values() if ok else []):
+        if not isinstance(st, dict):
+            ok = False
+            break
+        for key in ("by_category", "by_folder"):
+            if not (isinstance(st.get(key, {}), dict) and all(pair(v) for v in st.get(key, {}).values())):
+                ok = False
+        if not (isinstance(st.get("top_files", []), list) and all(triple(v) for v in st.get("top_files", []))):
+            ok = False
+        if not (isinstance(st.get("areas", []), list) and all(
+                isinstance(v, list) and len(v) == 3 and isinstance(v[0], str) and _is_num(v[1])
+                for v in st.get("areas", []))):
+            ok = False
+    if not ok:
+        bad("stats", "容量の集計")
+    if not isinstance(d.get("skip_counts", {}), dict):
+        bad("skip_counts", "スキップの件数")
+
+
+CHECKS = {"settings.json": _check_settings, "user_state.json": _check_user_state, "scan_state.json": _check_scan_state}
+
+
+def _parse(path: Path, name: str | None = None):
+    """(データ, 問題)。問題: None / 'missing' / 構文エラー / 形式違いの説明。name は検証に使う元のファイル名。"""
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
-        return default
-    except (OSError, ValueError):
-        # 壊れていたら退避して既定値で続ける（元のファイルは消さない）
-        try:
-            os.replace(path, path.with_suffix(path.suffix + f".broken-{int(time.time())}"))
-        except OSError:
-            pass
-        return default
+        return None, "missing"
+    except UnicodeDecodeError:
+        return None, "文字コードが正しくありません（途中までの書き込みの可能性）"
+    except ValueError:
+        return None, "JSON として読めません（壊れている・途中までの書き込みの可能性）"
+    except OSError as e:
+        return None, f"読み込めません（{e.strerror or e}）"
+    problem = CHECKS[name or path.name](data)
+    return (None, problem) if problem else (data, None)
 
 
-def _write_json(path: Path, data) -> None:
+PENDING_MARK = "protection_recovery_pending.json"
+
+
+def _load_json(path: Path, default, problems: list[str], pending_mark: Path | None = None) -> tuple[object, bool]:
+    """検証して読み込む。読めなければ元のファイルを退避し、直前のバックアップ（.bak）から復旧する。
+
+    戻り値: (データ, 正しく読めたか（復旧できた場合を含む）)
+    """
+    data, problem = _parse(path)
+    if problem is None:
+        return data, True
+    bak = path.with_suffix(path.suffix + ".bak")
+    bak_data, bak_problem = _parse(bak, path.name) if bak.exists() else (None, "missing")
+    if problem != "missing":
+        moved = True
+        if pending_mark is not None and bak_problem is not None:
+            # 保護情報を復旧できない: 退避する前に「復旧待ち」の印を残す（再起動しても整理禁止を続けるため）
+            try:
+                _write_raw(pending_mark, {"file": path.name, "problem": problem, "at": time.time()})
+            except OSError:
+                moved = False  # 印を書けないときは、壊れたファイルを動かさない（次の起動でも検出できるように）
+        if moved:
+            try:  # 元のファイルは消さずに退避する
+                os.replace(path, path.with_suffix(path.suffix + f".broken-{int(time.time())}"))
+            except OSError:
+                pass
+    if pending_mark is not None and pending_mark.exists():
+        problems.append(f"{path.name}: 保護・判断の記録の復旧待ちです（設定画面で初期化するまで整理操作を止めます）")
+        return default, False
+    if bak.exists():
+        data, bproblem = bak_data, bak_problem
+        if bproblem is None:
+            if problem != "missing":
+                problems.append(f"{path.name}: {problem}。直前のバックアップから復旧しました")
+            return data, True
+        problems.append(f"{path.name}: {problem}。バックアップも使えません（{bproblem}）")
+        return default, False
+    if problem == "missing":
+        return default, True  # 初めての起動
+    problems.append(f"{path.name}: {problem}。バックアップがないため復旧できません")
+    return default, False
+
+
+def _write_raw(path: Path, data) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _write_json(path: Path, data) -> None:
+    """一時ファイルに書いて置き換える。直前の正常なファイルは .bak として残す。失敗したら StoreError。"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        if path.exists():
+            os.replace(path, path.with_suffix(path.suffix + ".bak"))
+        os.replace(tmp, path)
+    except OSError as e:
+        raise StoreError(f"{path.name} を保存できませんでした（{e.strerror or e}）。変更は反映されていません") from e
 
 
 def _key(row) -> str:
@@ -94,15 +248,23 @@ class Store:
         self.thumb_dir.mkdir(exist_ok=True)
         self.inventory_dir.mkdir(exist_ok=True)
         self.lock = threading.RLock()
-        self._settings = _read_json(self.data_dir / "settings.json", {})
-        self._user = _read_json(self.data_dir / "user_state.json", {})
-        self._scan = _read_json(self.data_dir / "scan_state.json", {})
+        self.load_problems: list[str] = []
+        self._settings, _ = _load_json(self.data_dir / "settings.json", {}, self.load_problems)
+        self._user, self.protection_ok = _load_json(self.data_dir / "user_state.json", {}, self.load_problems,
+                                                    pending_mark=self.data_dir / PENDING_MARK)
+        self._scan, _ = _load_json(self.data_dir / "scan_state.json", {}, self.load_problems)
+        _clean_derived(self._scan, self.load_problems)
+        self._sanitize_settings()
         self._scan.setdefault("locations", [])
         self._scan.setdefault("skips", [])
         self._scan.setdefault("stats", {})
         self._scan.setdefault("similar_groups", {})
         self._rows: dict[int, dict] = {}
         self._by_path: dict[str, int] = {}
+        # 調査結果の世代番号（ファイルの情報・重複・類似の関係が変わるたびに進む）と、調査・整理の排他
+        self.generation = 0
+        self.scan_active = False
+        self.organize_active = False
         self._next_id = 1
         self._analysis_path = self.data_dir / "analysis.jsonl"
         self._load()
@@ -114,9 +276,16 @@ class Store:
                 with gzip.open(f, "rt", encoding="utf-8") as fh:
                     data = json.load(fh)
             except (OSError, ValueError, EOFError):
+                self.load_problems.append(f"{f.name}: 調査結果を読めません（次の調査で作り直します）")
                 continue  # 壊れた一覧は使わない（次の調査で作り直される）
-            for rec in data.get("files", []):
+            files = data.get("files") if isinstance(data, dict) else None
+            if not isinstance(files, list) or not all(isinstance(r, list) and len(r) == 8 for r in files):
+                self.load_problems.append(f"{f.name}: 調査結果の形式が正しくありません（次の調査で作り直します）")
+                continue
+            for rec in files:
                 path, name, folder, size, mtime, ext, kind, cloud = rec
+                if not (isinstance(path, str) and _is_num(size) and _is_num(mtime)):
+                    continue
                 if path in self._by_path:
                     continue
                 self._new_row(path, name, folder, size, mtime, ext, kind, cloud, data.get("location"),
@@ -139,6 +308,7 @@ class Store:
     def _read_analysis(self) -> dict[str, dict]:
         cache: dict[str, dict] = {}
         self._analysis_lines = 0
+        bad = 0
         try:
             with open(self._analysis_path, encoding="utf-8") as f:
                 for line in f:
@@ -146,10 +316,19 @@ class Store:
                     try:
                         rec = json.loads(line)
                     except ValueError:
+                        bad += 1
                         continue  # 途中で落ちたときの壊れた行は読み飛ばす
-                    cache.setdefault(rec["k"], {}).update(rec["f"])
+                    if not (isinstance(rec, dict) and isinstance(rec.get("k"), str) and isinstance(rec.get("f"), dict)):
+                        bad += 1
+                        continue
+                    fields = {k: v for k, v in rec["f"].items() if k in ANALYSIS_FIELDS}
+                    cache.setdefault(rec["k"], {}).update(fields)
         except FileNotFoundError:
             pass
+        except (OSError, UnicodeDecodeError):
+            self.load_problems.append("analysis.jsonl: 解析結果を読めません（必要に応じて解析し直します）")
+        if bad:
+            self.load_problems.append(f"analysis.jsonl: 読めない行が {bad} 行ありました（その分は解析し直します）")
         return cache
 
     def _compact_analysis(self) -> None:
@@ -175,6 +354,30 @@ class Store:
         self._by_path[path] = rid
         return row
 
+    SETTING_TYPES = {"ffmpeg_dir": (str,), "auto_scan_on_start": (str,), "scan_gen": (str, int),
+                     "scan_started": (str,), "scan_finished": (str,), "legacy_migrated": (str,),
+                     "files_scanned": (str,), "analysis_state": (str,),
+                     "view_history_started": (str,), "extra_locations": (list,), "excluded_folders": (list,),
+                     "disabled_locations": (list,), "not_scanned_drives": (list,)}
+
+    def _sanitize_settings(self) -> None:
+        """型が違う設定だけを使わない（ほかの設定は残す）。ファイルは次に保存するときに直る。"""
+        bad = []
+        for key, types in self.SETTING_TYPES.items():
+            v = self._settings.get(key)
+            if v is None:
+                continue
+            ok = isinstance(v, types) and not isinstance(v, bool)
+            if ok and key == "scan_gen":
+                ok = _is_int_text(str(v))
+            if ok and isinstance(v, list):
+                ok = all(isinstance(x, str) for x in v)
+            if not ok:
+                bad.append(key)
+                self._settings.pop(key)
+        if bad:
+            self.load_problems.append(f"settings.json: 値の形式が正しくない設定（{', '.join(bad)}）を使わずに起動しました")
+
     # --- 設定 -------------------------------------------------------------------
     def get_setting(self, key: str, default=None):
         with self.lock:
@@ -182,11 +385,13 @@ class Store:
 
     def set_setting(self, key: str, value) -> None:
         with self.lock:
+            new = dict(self._settings)
             if value is None:
-                self._settings.pop(key, None)
+                new.pop(key, None)
             else:
-                self._settings[key] = value
-            _write_json(self.data_dir / "settings.json", self._settings)
+                new[key] = value
+            _write_json(self.data_dir / "settings.json", new)  # 書けてから反映する
+            self._settings = new
 
     def json_list(self, key: str) -> list[str]:
         value = self.get_setting(key, [])
@@ -221,6 +426,7 @@ class Store:
         """records: (path, name, folder, size, mtime, ext, kind, cloud_only)。変更のないファイルは解析結果を使い続ける。"""
         added = changed = 0
         with self.lock:
+            self.generation += 1
             for path, name, folder, size, mtime, ext, kind, cloud in records:
                 path, folder = os.path.normpath(path), os.path.normpath(folder)
                 rid = self._by_path.get(path)
@@ -242,6 +448,7 @@ class Store:
 
     def update_file_state(self, media_id: int, size: int, mtime: float) -> bool:
         with self.lock:
+            self.generation += 1
             row = self._rows[media_id]
             if row["size"] != size or abs(row["mtime"] - mtime) > 1e-6:
                 self._invalidate(row, size, mtime)
@@ -259,6 +466,8 @@ class Store:
                 fields[key] = json.dumps(fields[key], ensure_ascii=False)
         with self.lock:
             row = self._rows[media_id]
+            if any(k in fields for k in ("sha256", "vsig")):
+                self.generation += 1  # 重複・類似の関係が変わりうる
             row.update(fields)
             persist = {k: v for k, v in fields.items() if k in ANALYSIS_FIELDS}
             if persist:
@@ -281,6 +490,7 @@ class Store:
 
     def mark_unseen_missing(self, location: str, gen: int) -> int:
         with self.lock:
+            self.generation += 1
             n = 0
             for r in self._rows.values():
                 if r["location"] == location and r["seen_gen"] < gen and not r["missing"]:
@@ -291,6 +501,7 @@ class Store:
     def hide(self, media_id: int, clear_decision: bool = True) -> None:
         """一覧から外す（ソースコードの .ts・除外した場所など）。保護・判断の記録は残す。"""
         with self.lock:
+            self.generation += 1
             self._rows[media_id]["missing"] = 1
         if clear_decision:
             self._set_user(media_id, decision=None)
@@ -316,31 +527,58 @@ class Store:
     # --- 保護・判断 ---------------------------------------------------------------
     def _set_user(self, media_id: int, **fields) -> None:
         with self.lock:
+            if not self.protection_ok:
+                raise StoreError("保護・判断の記録を読み込めなかったため、変更できません（設定画面で対処できます）")
             row = self._rows[media_id]
-            entry = self._user.setdefault(row["path"], {})
+            new = dict(self._user)
+            entry = dict(new.get(row["path"], {}))
             for k, v in fields.items():
-                row[k] = int(bool(v)) if k in ("protected", "favorite") else v
                 if v in (None, 0, False):
                     entry.pop(k, None)
                 else:
                     entry[k] = v
-            if not entry:
-                self._user.pop(row["path"], None)
-            _write_json(self.data_dir / "user_state.json", self._user)
+            if entry:
+                new[row["path"]] = entry
+            else:
+                new.pop(row["path"], None)
+            _write_json(self.data_dir / "user_state.json", new)  # 書けてから画面上の状態を変える
+            self._user = new
+            for k, v in fields.items():
+                row[k] = int(bool(v)) if k in ("protected", "favorite") else v
+
+    def reset_user_state(self) -> None:
+        """読み込めなかった保護・判断の記録を、利用者の明示の操作で初期化する（壊れたファイルは退避済み）。"""
+        with self.lock:
+            _write_json(self.data_dir / "user_state.json", {})
+            try:
+                os.remove(self.data_dir / PENDING_MARK)  # 利用者が明示して初期化したので、復旧待ちを解除する
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                raise StoreError(f"復旧待ちの印を消せませんでした（{e.strerror or e}）") from e
+            self._user = {}
+            self.protection_ok = True
+            for r in self._rows.values():
+                r.update(protected=0, decision=None, favorite=0, last_viewed=None)
 
     def import_user_state(self, entries: dict[str, dict]) -> None:
         """以前の版から保護・判断を取り込む（すでにある判断は上書きしない）。"""
         with self.lock:
+            if not self.protection_ok:
+                raise StoreError("保護・判断の記録を読み込めなかったため、取り込めません")
+            new = {p: dict(e) for p, e in self._user.items()}
             for path, entry in entries.items():
-                cur = self._user.setdefault(path, {})
+                cur = new.setdefault(path, {})
                 for k, v in entry.items():
                     cur.setdefault(k, v)
+            _write_json(self.data_dir / "user_state.json", new)
+            self._user = new
+            for path, cur in new.items():
                 rid = self._by_path.get(path)
                 if rid is not None:
                     row = self._rows[rid]
                     for k, v in cur.items():
                         row[k] = int(bool(v)) if k in ("protected", "favorite") else v
-            _write_json(self.data_dir / "user_state.json", self._user)
 
     def set_decision(self, media_id: int, decision: str | None) -> None:
         if decision is not None and decision not in DECISIONS:
@@ -358,9 +596,15 @@ class Store:
             self._set_user(media_id, protected=bool(value))
 
     def mark_viewed(self, media_id: int) -> None:
-        if self.get_setting("view_history_started") is None:
-            self.set_setting("view_history_started", str(time.time()))
-        self._set_user(media_id, last_viewed=time.time())
+        """このアプリで確認した日時を記録する（利用者の判断ではないので、記録できなくても表示は続ける）。"""
+        if not self.protection_ok:
+            return  # 保護・判断の記録が復旧待ち: 記録しない（情報の確認はできる）
+        try:
+            if self.get_setting("view_history_started") is None:
+                self.set_setting("view_history_started", str(time.time()))
+            self._set_user(media_id, last_viewed=time.time())
+        except StoreError:
+            pass
 
     def mark_trashed(self, media_id: int) -> None:
         with self.lock:
@@ -447,6 +691,7 @@ class Store:
 
     def set_similar_groups(self, groups: dict[int, list[int]]) -> None:
         with self.lock:
+            self.generation += 1
             for r in self._rows.values():
                 r["similar_group"] = None
             stored = {}
@@ -460,6 +705,7 @@ class Store:
     def set_video_groups(self, groups: list[list[int]]) -> None:
         """類似録画のグループ（パスで保存）。"""
         with self.lock:
+            self.generation += 1
             self._scan["video_groups"] = [[self._rows[i]["path"] for i in g] for g in groups]
             self.save_scan_state()
 

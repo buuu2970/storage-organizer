@@ -29,6 +29,7 @@ class TrashResult:
     ok: bool
     message: str
     status: str = ""  # moved（移動した） / skipped（安全確認で止めた） / failed（ごみ箱への移動に失敗）
+    record_error: str = ""  # 移動はできたが、その後の記録の保存に失敗した内容
 
     def __post_init__(self) -> None:
         if not self.status:
@@ -36,33 +37,68 @@ class TrashResult:
 
 
 def _windows_recycle(path: str) -> None:
-    """Windows のごみ箱へ移動する。完全削除になりそうな場合は Windows の警告で止められる。"""
+    """Windows のごみ箱へ移動する。完全削除になりそうな場合は Windows の警告で止められる。
+
+    別スレッドから呼ぶ場合は、そのスレッドで COM を初期化しておくこと（windows_com_thread を使う）。
+    """
     import ctypes
     from ctypes import wintypes
 
-    root = os.path.splitdrive(os.path.abspath(path))[0] + "\\"
+    full = os.path.abspath(path)
+    root = os.path.splitdrive(full)[0] + "\\"
 
     class SHQUERYRBINFO(ctypes.Structure):
         _fields_ = [("cbSize", wintypes.DWORD), ("i64Size", ctypes.c_longlong),
                     ("i64NumItems", ctypes.c_longlong)]
 
-    info = SHQUERYRBINFO(ctypes.sizeof(SHQUERYRBINFO), 0, 0)
-    if ctypes.windll.shell32.SHQueryRecycleBinW(root, ctypes.byref(info)) != 0:
-        raise TrashError(f"{root} にはごみ箱がないため移動できません（完全削除は行いません）")
-
     class SHFILEOPSTRUCTW(ctypes.Structure):
-        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
-                    ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", ctypes.c_void_p),
+                    ("pTo", ctypes.c_void_p), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
                     ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
 
-    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_WANTNUKEWARNING = 3, 0x4, 0x10, 0x40, 0x4000
-    op = SHFILEOPSTRUCTW(None, FO_DELETE, os.path.abspath(path) + "\0", None,
-                         FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_WANTNUKEWARNING, False, None, None)
-    rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    shell32 = ctypes.windll.shell32
+    shell32.SHQueryRecycleBinW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SHQUERYRBINFO)]
+    shell32.SHQueryRecycleBinW.restype = ctypes.c_long
+    shell32.SHFileOperationW.argtypes = [ctypes.POINTER(SHFILEOPSTRUCTW)]
+    shell32.SHFileOperationW.restype = ctypes.c_int
+
+    info = SHQUERYRBINFO(ctypes.sizeof(SHQUERYRBINFO), 0, 0)
+    if shell32.SHQueryRecycleBinW(root, ctypes.byref(info)) != 0:
+        raise TrashError(f"{root} にはごみ箱がないため移動できません（完全削除は行いません）")
+    # pFrom は二重の NUL で終わる文字列。呼び出しが終わるまで buffer を保持する
+    buffer = ctypes.create_unicode_buffer(full + "\0")
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO = 3, 0x4, 0x10, 0x40
+    FOF_NOERRORUI, FOF_WANTNUKEWARNING = 0x400, 0x4000
+    op = SHFILEOPSTRUCTW()
+    op.hwnd = None
+    op.wFunc = FO_DELETE
+    op.pFrom = ctypes.cast(buffer, ctypes.c_void_p)
+    op.pTo = None
+    # エラーはダイアログを出さず戻り値で受け取る。完全削除になりそうなときの Windows の警告は残す
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING
+    rc = shell32.SHFileOperationW(ctypes.byref(op))
     if rc != 0:
-        raise TrashError(f"ごみ箱へ移動できませんでした（エラーコード {rc}）")
+        raise TrashError(f"ごみ箱へ移動できませんでした（エラーコード {rc:#x}）")
     if op.fAnyOperationsAborted:
         raise TrashError("ごみ箱へ移動できないため中止しました（完全削除は行っていません）")
+
+
+class windows_com_thread:
+    """別スレッドで Windows のごみ箱を使う前後に、COM を初期化・終了する（Windows 以外では何もしない）。"""
+
+    def __enter__(self):
+        self._init = False
+        if sys.platform == "win32":
+            import ctypes
+            hr = ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+            self._init = hr in (0, 1)  # S_OK / S_FALSE（すでに初期化済み）
+        return self
+
+    def __exit__(self, *exc):
+        if self._init:
+            import ctypes
+            ctypes.windll.ole32.CoUninitialize()
+        return False
 
 
 def default_backend() -> Callable[[str], None]:
@@ -146,52 +182,165 @@ def similar_check(db: Database, ctx: candidates.Context, ids: list[int]) -> set[
     return blocked
 
 
-def move_to_trash(db: Database, ids: list[int], backend: Callable[[str], None] | None = None) -> list[TrashResult]:
+def _stat(path: str):
+    try:
+        st = os.stat(path)
+        return st.st_size, st.st_mtime_ns
+    except OSError:
+        return None
+
+
+def move_to_trash(db: Database, ids: list[int], backend: Callable[[str], None] | None = None,
+                  progress: Callable[[int, int, str], None] | None = None, cancel=None,
+                  expected_generation: int | None = None) -> list[TrashResult]:
     """確認済みのファイルをごみ箱へ移動する。1件ずつ確認・移動し、結果を返す。"""
     backend = backend or default_backend()
+    def stop_all(message):
+        return [TrashResult(m, (db.video(m) or {}).get("path", ""), (db.video(m) or {}).get("size", 0), False, message)
+                for m in ids]
+    if getattr(db, "scan_active", False):  # 調査と整理は同時に行わない（処理側でも防ぐ）
+        return stop_all("調査中のため移動しませんでした。調査が終わってから、もう一度確認してください")
+    if expected_generation is not None and getattr(db, "generation", 0) != expected_generation:
+        return stop_all("確認したあとに調査結果が更新されました。内容が変わった可能性があるため、もう一度確認してください")
+    if not getattr(db, "protection_ok", True):  # 保護情報が読めない状態で「保護なし」として整理しない
+        return [TrashResult(m, (db.video(m) or {}).get("path", ""), (db.video(m) or {}).get("size", 0), False,
+                            "保護・判断の記録を読み込めなかったため、整理操作を止めています") for m in ids]
     ctx = candidates.Context(db)
     blocked = survivors_check(db, ctx, ids)
     similar_blocked = similar_check(db, ctx, ids)
     results = []
     moved_identities: set = set()
-    for media_id in ids:
+    start_generation = getattr(db, "generation", 0)
+    # 確認時点の記録: グループに関わる全ファイルの、いまのディスク上のサイズと更新日時（ナノ秒）。
+    # 保存されている情報が整理中に再スキャンで書き換わっても、この記録と比べて変化を見つける
+    involved = set(ids)
+    for m in ids:
+        h = ctx.dup_of.get(m)
+        if h is not None:
+            involved |= set(ctx.dup_groups[h])
+        n_ = ctx.vgroup_of.get(m)
+        if n_ is not None:
+            involved |= set(ctx.video_groups[n_])
+    snapshot = {}
+    for m in involved:
+        row = db.video(m)
+        if row is None:
+            continue
+        st = _stat(row["path"])
+        # 保存された情報（確認の根拠）とディスクがすでに違うものは、最初から「変更あり」として扱う
+        if st is None or st[0] != row["size"] or abs(st[1] / 1e9 - row["mtime"]) > 1e-6:
+            snapshot[m] = None
+        else:
+            snapshot[m] = (row["path"], st)
+    if hasattr(db, "organize_active"):
+        db.organize_active = True
+    try:
+        return _move_all(db, ctx, ids, backend, progress, cancel, blocked, similar_blocked, snapshot,
+                         start_generation, results, moved_identities)
+    finally:
+        if hasattr(db, "organize_active"):
+            db.organize_active = False
+
+
+def _move_all(db, ctx, ids, backend, progress, cancel, blocked, similar_blocked, snapshot, start_generation,
+              results, moved_identities):
+    # 実際に移動しようとするファイル（最後の1本として残すと決めたものは除く）
+    will_move = set(ids) - blocked - similar_blocked
+    moving_idents = {candidates.file_identity(db.video(m)["path"]) for m in will_move if db.video(m) is not None}
+    for n, media_id in enumerate(ids):
         row = db.video(media_id)
-        if media_id in ctx.aliases:  # 同じ実体が別の表記で登録されたもの
-            results.append(TrashResult(media_id, row["path"], row["size"], False,
-                                       "同じファイルが別の表記で二重に登録されているため、移動しませんでした"))
+        if cancel is not None and cancel.is_set():  # ファイル単位の区切りで止める。残りは「中断」として結果に残す
+            results.append(TrashResult(media_id, row["path"] if row else "", row["size"] if row else 0, False,
+                                       "中断したため移動しませんでした"))
             continue
-        ident = candidates.file_identity(row["path"]) if row else None
-        if ident in moved_identities:
-            results.append(TrashResult(media_id, row["path"], row["size"], False,
-                                       "同じファイルをすでに移動しています"))
-            continue
-        if media_id in similar_blocked:
-            results.append(TrashResult(media_id, row["path"], row["size"], False,
-                                       "類似録画は、比較して残す1本を選んでから移動できます"
-                                       "（残す録画が見つからない・変更された場合も移動しません）"))
-            continue
-        if media_id in blocked:
-            results.append(TrashResult(media_id, row["path"], row["size"], False,
-                                       "同じ内容のファイルがほかに残っていないため、このファイルは移動しませんでした"
-                                       "（重複の最後の1本を残します）"))
-            continue
-        problem = check(db, media_id, ctx)
-        if problem:
-            results.append(TrashResult(media_id, row["path"] if row else "", row["size"] if row else 0, False, problem))
+        if getattr(db, "generation", 0) != start_generation or getattr(db, "scan_active", False):
+            results.append(TrashResult(media_id, row["path"] if row else "", row["size"] if row else 0, False,
+                                       "整理中に調査結果が更新されたため、残りは移動しませんでした（もう一度確認してください）"))
             continue
         try:
-            backend(row["path"])
-        except Exception as e:  # 失敗しても完全削除には切り替えない
-            results.append(TrashResult(media_id, row["path"], row["size"], False, str(e), "failed"))
-            db.log_trash(row["path"], row["size"], "error", str(e))
-            continue
-        if os.path.exists(row["path"]):
-            results.append(TrashResult(media_id, row["path"], row["size"], False,
-                                       "移動を確認できませんでした（ファイルが残っています）", "failed"))
-            db.log_trash(row["path"], row["size"], "error", "移動後もファイルが残っている")
-            continue
-        moved_identities.add(ident)
-        db.mark_trashed(media_id)
-        db.log_trash(row["path"], row["size"], "moved", None)
-        results.append(TrashResult(media_id, row["path"], row["size"], True, "ごみ箱へ移動しました"))
+            results.append(_move_one(db, ctx, media_id, row, n, len(ids), backend, progress, blocked,
+                                     similar_blocked, will_move, moving_idents, moved_identities, snapshot))
+        except Exception as e:  # noqa: BLE001  1件の想定外の失敗で、それまでの結果を失わない
+            results.append(TrashResult(media_id, row["path"] if row else "", row["size"] if row else 0, False,
+                                       f"想定外のエラーのため移動しませんでした（{e}）", "failed"))
     return results
+
+
+def _snap_intact(snapshot: dict, m: int) -> bool:
+    """確認時点の記録と、いまのディスクが一致するか（保存されている情報には頼らない）。"""
+    rec = snapshot.get(m)
+    return rec is not None and _stat(rec[0]) == rec[1]
+
+
+def _keeper_ok(db: Database, ctx: candidates.Context, media_id: int, will_move: set, moving_idents: set,
+               snapshot: dict | None = None) -> str | None:
+    """移動の直前に、同じグループの「残す側」が実在・未変更かを確かめる。問題があれば理由を返す。"""
+    intact = (lambda m: _snap_intact(snapshot, m)) if snapshot is not None else (lambda m: _intact(db, m))
+    h = ctx.dup_of.get(media_id)
+    if h is not None:
+        others = [m for m in ctx.dup_groups[h] if m != media_id and m not in will_move]
+        if not any(intact(m) and candidates.file_identity(db.video(m)["path"]) not in moving_idents for m in others):
+            return ("同じ内容の残すファイルが見つからない・変更されたため、移動しませんでした"
+                    "（重複の最後の1本を残します）")
+    n = ctx.vgroup_of.get(media_id)
+    if n is not None:
+        keepers = [m for m in ctx.video_groups[n] if m != media_id and m not in will_move
+                   and (db.video(m)["protected"] or db.video(m)["decision"] == "残す")]
+        if not any(intact(m) and candidates.file_identity(db.video(m)["path"]) not in moving_idents for m in keepers):
+            return "類似録画の残す録画が見つからない・変更されたため、移動しませんでした"
+    return None
+
+
+def _move_one(db, ctx, media_id, row, n, total, backend, progress, blocked, similar_blocked, will_move,
+              moving_idents, moved_identities, snapshot=None) -> TrashResult:
+    if progress is not None:
+        progress(n, total, row["name"] if row else "")
+    if row is None:
+        return TrashResult(media_id, "", 0, False, "一覧にないファイルです")
+    if media_id in ctx.aliases:  # 同じ実体が別の表記で登録されたもの
+        return TrashResult(media_id, row["path"], row["size"], False,
+                           "同じファイルが別の表記で二重に登録されているため、移動しませんでした")
+    ident = candidates.file_identity(row["path"])
+    if ident in moved_identities:
+        return TrashResult(media_id, row["path"], row["size"], False, "同じファイルをすでに移動しています")
+    if media_id in similar_blocked:
+        return TrashResult(media_id, row["path"], row["size"], False,
+                           "類似録画は、比較して残す1本を選んでから移動できます（残す録画が見つからない・変更された場合も移動しません）")
+    if media_id in blocked:
+        return TrashResult(media_id, row["path"], row["size"], False,
+                           "同じ内容のファイルがほかに残っていないため、このファイルは移動しませんでした（重複の最後の1本を残します）")
+    problem = check(db, media_id, ctx) or _keeper_ok(db, ctx, media_id, will_move, moving_idents, snapshot)
+    if not problem and snapshot is not None and media_id in snapshot and not _snap_intact(snapshot, media_id):
+        problem = "確認したあとにファイルが変更されています。もう一度確認してください"
+    if problem:  # 存在・変更・保護と、残す側を移動の直前に確かめる
+        return TrashResult(media_id, row["path"], row["size"], False, problem)
+    try:
+        backend(row["path"])
+    except Exception as e:  # 失敗しても完全削除には切り替えない
+        _safe_log(db, row, "error", str(e))
+        return TrashResult(media_id, row["path"], row["size"], False, str(e), "failed")
+    if os.path.exists(row["path"]):
+        _safe_log(db, row, "error", "移動後もファイルが残っている")
+        return TrashResult(media_id, row["path"], row["size"], False,
+                           "移動を確認できませんでした（ファイルが残っています）", "failed")
+    moved_identities.add(ident)
+    # ここから先は「移動した」ことが確定。記録の失敗は、移動の結果とは分けて伝える
+    errors = []
+    try:
+        db.mark_trashed(media_id)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"状態の保存: {e}")
+    if not _safe_log(db, row, "moved", None):
+        errors.append("移動の記録")
+    message = "ごみ箱へ移動しました"
+    if errors:
+        message += f"（ただし記録の保存に失敗しました: {' / '.join(errors)}。次の調査で反映されます）"
+    return TrashResult(media_id, row["path"], row["size"], True, message, record_error=" / ".join(errors))
+
+
+def _safe_log(db, row, result: str, message: str | None) -> bool:
+    try:
+        db.log_trash(row["path"], row["size"], result, message)
+        return True
+    except Exception:  # noqa: BLE001  記録の失敗で、移動の結果を失わない
+        return False

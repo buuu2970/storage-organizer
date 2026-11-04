@@ -95,6 +95,8 @@ class Env:
         make_photo(self.drive / "Media" / "drive_photo.jpg", size=(1200, 900))
         (self.drive / "SomeApp").mkdir()
         (self.drive / "SomeApp" / "app.exe").write_bytes(b"MZ")
+        # 指摘1の修正: 実行ファイルだけではアプリのフォルダとしない。実際のアプリと同じくライブラリも置く
+        (self.drive / "SomeApp" / "app.dll").write_bytes(b"MZ")
         make_photo(self.drive / "SomeApp" / "logo.png")
         Image.new("RGB", (16, 16), (1, 2, 3)).save(self.drive / "Media" / "icon.png")
         (self.drive / "Windows").mkdir()
@@ -481,10 +483,10 @@ class OrganizerGuiTest(unittest.TestCase):
         QCoreApplication.processEvents()
 
     def test_navigation_reaches_all_sections(self):
-        # 仕様変更: 動画AI（試作）をアプリから外し、メニューを録画整理の流れに合わせた
+        # 仕様変更（初心者向け UX）: メニューを 4 つにし、容量の内訳はホームから、画像の整理はファイルを見るから開く
         w = self.w
         self.assertEqual([w.nav.item(i).data(0x0100) for i in range(w.nav.count())],
-                         ["ホーム", "整理候補", "容量の内訳", "ファイル一覧", "画像の整理（補助）", "設定"])
+                         ["ホーム", "整理する", "ファイルを見る", "設定"])
         for page in w.sections:
             w.show_section(page)
             QCoreApplication.processEvents()
@@ -495,10 +497,13 @@ class OrganizerGuiTest(unittest.TestCase):
             w.show_category(name)
             self.assertIs(w.stack.currentWidget(), w.recommend)
             self.assertEqual(w.recommend.category, name)
+        # 仕様変更: 絞り込みは表示名（あとで決める・すべて）と保存データの値を分けた。値で確かめる
         for name, state in (("保護", "保護中"), ("保留", "保留"), ("すべて", "すべての判断")):
             w.show_category(name)
             self.assertIs(w.stack.currentWidget(), w.files)
-            self.assertEqual(w.files.state_filter.currentText(), state)
+            self.assertEqual(w.files.state_filter.currentData(), state)
+        w.show_category("保留")
+        self.assertEqual(w.files.state_filter.currentText(), "あとで決める")
         # 通常の動作では旧 DB（SQLite）を読み込まない（ほかのテストの影響を受けないよう、別プロセスで確かめる）
         code = ("import sys, tempfile; from PySide6.QtWidgets import QApplication; app = QApplication([]); "
                 "from storage_organizer.store import Store; from storage_organizer.main_window import MainWindow; "
@@ -512,7 +517,7 @@ class OrganizerGuiTest(unittest.TestCase):
     def test_first_run_home_and_empty_states(self):
         w = self.w
         self.assertFalse(self.state.runner.is_running())  # 初回は自動で始めず、調べる場所を選んでもらう
-        self.assertEqual(w.home.primary.text(), "PCを調べる")  # 仕様変更: 主操作の名称
+        self.assertEqual(w.home.primary.text(), "PCの容量を調べる")  # 仕様変更（初心者向け UX）: 主操作の名称
         self.assertEqual(w.home.total.value.text(), "未調査")
         self.assertEqual(w.home.saving.value.text(), "算出できません")
         self.assertIn("実際の値", w.home.free.detail.text())
@@ -1263,7 +1268,7 @@ class ErrorLogTest(unittest.TestCase):
                 sys.excepthook = old
         self.assertIn("%USERPROFILE%", text)
         self.assertNotIn(home + "/", text)
-        self.assertIn("RecSort 0.9.0rc2", text)  # バージョン更新
+        self.assertIn("RecSort 0.9.0rc3", text)  # バージョン更新
 
 
 class SourceCodeTest(unittest.TestCase):
@@ -1470,8 +1475,9 @@ class PlanGuiTest(unittest.TestCase):
         flow.final.backend = backend
         flow.final.move_button.click()
         flow.final.move_button.click()  # 二重に押しても1回だけ
+        # 仕様変更: ごみ箱への移動は別スレッドで行う（画面を止めない）。結果画面になるまで待つ
+        self.assertTrue(wait_until(lambda: flow.stack.currentWidget() is flow.result, 30))
         self.assertEqual(len(moved), 1)
-        self.assertIs(flow.stack.currentWidget(), flow.result)
         report = flow.result.summary.text()
         self.assertIn("ごみ箱へ移動: 1 件", report)
         self.assertIn("移動に失敗した: 1 件", report)
@@ -1540,6 +1546,40 @@ class PlanGuiTest(unittest.TestCase):
         p.tree.setCurrentItem(broken)
         self.assertTrue(wait_until(lambda: player.state_text.startswith("再生できません"), 10))
         self.assertTrue(player.error_label.text())
+
+    @unittest.skipUnless(FFMPEG.available, "FFmpeg がありません")
+    def test_candidate_list_shows_thumbnails_without_clicking(self):
+        """候補一覧を出した時点で、クリックしなくても各行にサムネイルが表示される。"""
+        w = self.w
+        w.show_plan(None)
+        p = self.plan_with(1)
+        rows = []
+        for i in range(p.tree.topLevelItemCount()):
+            top = p.tree.topLevelItem(i)
+            rows += [top.child(j) for j in range(top.childCount())]
+        self.assertTrue(rows)
+        self.assertIsNone(p.tree.currentItem())  # まだ何も選んでいない
+        self.assertFalse(p.detail.isVisible())
+        self.assertEqual(p.tree.iconSize().width(), 96)
+
+        def state_of(item):
+            return item.data(0, Qt.ItemDataRole.UserRole + 3)
+
+        def all_done():  # 「準備中」が残っていない（できた・作れなかった、のどちらかになった）
+            QCoreApplication.processEvents()
+            return all(state_of(it) in ("ready", "failed", "cloud") for it in rows)
+        self.assertTrue(wait_until(all_done, 30))
+        names = {w.ctx.db.video(it.data(0, Qt.ItemDataRole.UserRole) or it.data(0, Qt.ItemDataRole.UserRole + 2))["name"]:
+                 state_of(it) for it in rows}
+        self.assertEqual(names.get("short.mp4"), "ready")
+        if "broken.mp4" in names:
+            self.assertEqual(names["broken.mp4"], "failed")  # 「準備中」のままにせず「サムネイルなし」と示す
+
+        icon = rows[0].icon(0).pixmap(96, 54)
+        self.assertEqual((icon.width(), icon.height()), (96, 54))
+        w.resize(911, 512)  # 低い画面ではサムネイルを小さくして行数を確保する
+        QCoreApplication.processEvents()
+        self.assertEqual(p.tree.iconSize().width(), 64)
 
     def test_home_shows_no_stale_calculating_after_scan(self):
         w = self.w

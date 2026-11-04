@@ -127,5 +127,54 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and "--extra" not in sys.argv:
     sys.exit(main())
+
+
+def extra_cases(root: Path) -> dict:
+    """追加の評価: 一部の場面だけ違う・音声だけ違う・共通画面が長い別動画。"""
+    tools = media.find_ffmpeg()
+    root.mkdir(parents=True, exist_ok=True)
+    src = "testsrc2=s=320x180:r=15"
+
+    def make(name, *args):
+        ff(tools, *args, str(root / name))
+        return str(root / name)
+
+    a = make("a.mp4", "-f", "lavfi", "-i", src, "-t", "24", "-pix_fmt", "yuv420p", "-c:v", "libx264")
+    # 一部の場面だけ違う: 8〜16秒を別の映像に差し替え（長さは同じ）
+    make("_mid.mp4", "-f", "lavfi", "-i", "mandelbrot=s=320x180:r=15", "-t", "8", "-pix_fmt", "yuv420p", "-c:v", "libx264")
+    make("_p1.mp4", "-i", a, "-t", "8", "-c:v", "libx264")
+    make("_p3.mp4", "-ss", "16", "-i", a, "-c:v", "libx264")
+    (root / "_l.txt").write_text(f"file '{root/'_p1.mp4'}'\nfile '{root/'_mid.mp4'}'\nfile '{root/'_p3.mp4'}'\n")
+    part = make("partial.mp4", "-f", "concat", "-safe", "0", "-i", str(root / "_l.txt"), "-c:v", "libx264")
+    # 音声だけ違う
+    au1 = make("audio1.mp4", "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", "sine=frequency=440", "-t", "12",
+               "-pix_fmt", "yuv420p", "-c:v", "libx264", "-g", "15", "-c:a", "aac")
+    au2 = make("audio2.mp4", "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", "sine=frequency=880", "-t", "12",
+               "-pix_fmt", "yuv420p", "-c:v", "libx264", "-g", "15", "-c:a", "aac")
+    # 共通画面が長い別動画: 共通タイトル 8 秒 + 本編 4 秒（別） + 共通エンディング 8 秒
+    make("_t.mp4", "-f", "lavfi", "-i", "smptehdbars=s=320x180:r=15", "-t", "8", "-pix_fmt", "yuv420p", "-c:v", "libx264")
+    make("_e.mp4", "-f", "lavfi", "-i", "testsrc=s=320x180:r=15", "-t", "8", "-pix_fmt", "yuv420p", "-c:v", "libx264")
+    shared = []
+    for key, body in (("x", "life=s=320x180:r=15:mold=10"), ("y", "cellauto=s=320x180:r=15:rule=110")):
+        make(f"_b{key}.mp4", "-f", "lavfi", "-i", body, "-t", "4", "-pix_fmt", "yuv420p", "-c:v", "libx264")
+        (root / f"_s{key}.txt").write_text(f"file '{root/'_t.mp4'}'\nfile '{root/f'_b{key}.mp4'}'\nfile '{root/'_e.mp4'}'\n")
+        shared.append(make(f"shared_{key}.mp4", "-f", "concat", "-safe", "0", "-i", str(root / f"_s{key}.txt"),
+                           "-c:v", "libx264"))
+    out = {}
+    for label, (p, q) in {"一部の場面だけ違う（同じ長さ）": (a, part), "音声だけ違う": (au1, au2),
+                          "共通画面が長い別動画（共通 16 秒／20 秒）": tuple(shared)}.items():
+        sp = similar.signature(tools, p, media.probe(tools, p)["duration"])
+        sq = similar.signature(tools, q, media.probe(tools, q)["duration"])
+        r = similar.compare(sp, sq)
+        per = r["per_frame"]
+        out[label] = {"判定": r["verdict"], "一致": r["matched"], "比較できた場面": r["informative"],
+                      "一致しない場面": [i for i, c in enumerate(per) if c is not None and c < similar.MATCH_CORR]}
+    return out
+
+
+if __name__ == "__main__" and "--extra" in sys.argv:
+    work = Path(tempfile.mkdtemp(prefix="recsort_eval_extra_"))
+    print(json.dumps(extra_cases(work), ensure_ascii=False, indent=1))
+    shutil.rmtree(work, ignore_errors=True)

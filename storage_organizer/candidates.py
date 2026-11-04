@@ -179,7 +179,7 @@ def find_exact_duplicates(db: Database, ctl, report) -> bool:
     for i, row in enumerate(todo):
         if not ctl.checkpoint(report, "完全重複の確認"):
             return False
-        report({"phase": "hash", "text": f"完全重複を確認中（{done[0] / 1024 ** 2:,.0f} / {total / 1024 ** 2:,.0f} MB）",
+        report({"phase": "hash", "text": f"同じ内容のファイルを確認しています（{done[0] / 1024 ** 2:,.0f} / {total / 1024 ** 2:,.0f} MB）",
                 "done": done[0], "total": total})
         try:
             size, mtime_ns = media.file_state(row["path"])
@@ -250,16 +250,14 @@ def find_similar_videos(db: Database, tools: media.FFmpegTools, ctl, report) -> 
     rows.sort(key=lambda r: loads(r["meta"])["duration"])
     durations = [loads(r["meta"])["duration"] for r in rows]
     need = set()
-    for i in range(len(rows)):
-        for j in range(i + 1, len(rows)):
-            if not similar.duration_close(durations[i], durations[j]):
-                break
-            need.update((i, j))
+    for i in range(len(rows) - 1):  # 長さが近い録画が1本でもある動画だけ（隣どうしを見れば足りる）
+        if similar.duration_close(durations[i], durations[i + 1]):
+            need.update((i, i + 1))
     todo = [rows[i] for i in sorted(need) if (loads(rows[i]["vsig"], {}) or {}).get("v") != similar.VERSION]
     for n, row in enumerate(todo):
         if not ctl.checkpoint(report, "類似録画の確認"):
             return False
-        report({"phase": "similar", "text": f"似た録画を確認中 {n + 1}/{len(todo)}: {row['name']}",
+        report({"phase": "similar", "text": f"似た録画を確認しています（代表場面の取り出し {n + 1} / {len(todo)}）",
                 "done": n, "total": len(todo)})
         try:
             before = media.file_state(row["path"])
@@ -271,7 +269,15 @@ def find_similar_videos(db: Database, tools: media.FFmpegTools, ctl, report) -> 
         except (OSError, RuntimeError, TimeoutError, media.FileChanged):
             continue
     sigs = {rows[i]["id"]: loads(rows[i]["vsig"]) for i in sorted(need) if loads(rows[i]["vsig"], {})}
-    groups, _ = similar.group(sigs)
+    label = {"prepare": "似た録画を確認しています（候補を絞り込み中）", "compare": "似た録画を確認しています（比較中）",
+             "group": "似た録画を確認しています（まとめ中）"}
+    try:
+        groups, stats = similar.group(
+            sigs, cancel=ctl.cancel_event,
+            progress=lambda stage, done, total: report({"phase": "similar", "done": done, "total": total,
+                                                        "text": f"{label[stage]} {done} / {total}"}))
+    except similar.Cancelled:
+        return False  # 途中の結果は保存しない（前回の結果のまま。完了扱いにしない）
     # すべて完全一致のグループは「重複」で扱う
     groups = [g for g in groups if len({db.video(i)["sha256"] for i in g} - {None}) != 1
               or any(db.video(i)["sha256"] is None for i in g)]
@@ -286,7 +292,7 @@ def run_analysis(db: Database, tools: media.FFmpegTools, ctl, report) -> bool:
     for i, row in enumerate(todo):
         if not ctl.checkpoint(report, "解析"):
             return False
-        report({"phase": "analyze", "text": f"新しいファイルを解析中 {i + 1}/{len(todo)}: {row['name']}",
+        report({"phase": "analyze", "text": f"録画の長さや画面を確認しています（{i + 1} / {len(todo)}）",
                 "done": i, "total": len(todo), "refresh": i % 50 == 0})
         try:
             light_analyze(db, row, tools, ctl.cancel_event)
@@ -393,7 +399,8 @@ class Context:
             return out
         self.video_groups = [g for g in (collapse(grp) for grp in vg) if len(g) > 1]
         self.vgroup_of = {i: n for n, g in enumerate(self.video_groups) for i in g}
-        self.vgroup_keep = {n: keep_for_similar_videos([self.rows[i] for i in g])
+        self.vgroup_detail = {n: similar_group_detail(self.rows, g) for n, g in enumerate(self.video_groups)}
+        self.vgroup_keep = {n: keep_for_similar_videos([self.rows[i] for i in g], self.vgroup_detail[n])
                             for n, g in enumerate(self.video_groups)}
         self.sim_keep = {g: keep_for_similar([self.rows[i] for i in ids]) for g, ids in self.sim_groups.items()}
 
@@ -432,7 +439,7 @@ class Context:
         if n is not None:
             others = len(self.video_groups[n]) - 1
             keep_id, why = self.vgroup_keep[n]
-            text = (f"類似録画: 長さがほぼ同じで、代表場面の大半が一致する録画が他に {others} 本あります"
+            text = (f"類似録画: 長さがほぼ同じ録画が他に {others} 本あります。{self.vgroup_detail[n]['text']}"
                     "（同じ内容とは限りません。比較して確認してください）")
             if keep_id == row["id"]:
                 text += f"。この録画を残すおすすめです（{why}）"
@@ -470,10 +477,43 @@ def keep_for_duplicates(rows) -> tuple[int, str]:
     return best["id"], "最も古くから保存されているファイルです"
 
 
-def keep_for_similar_videos(rows) -> tuple[int | None, str]:
+LIMITS_NOTE = "全編と音声は比較していません"
+
+
+def similar_pair_detail(a_row, b_row) -> dict:
+    """2本の代表場面の一致状況（一致・不一致・比較できない場面の番号）。"""
+    a, b = loads(a_row["vsig"], {}) or {}, loads(b_row["vsig"], {}) or {}
+    if not a.get("frames") or not b.get("frames"):
+        return {"matched": [], "unmatched": [], "uncomparable": list(range(similar.N_POINTS)), "per_frame": []}
+    r = similar.compare(a, b)
+    per = r["per_frame"]
+    return {"matched": [i for i, c in enumerate(per) if c is not None and c >= similar.MATCH_CORR],
+            "unmatched": [i for i, c in enumerate(per) if c is not None and c < similar.MATCH_CORR],
+            "uncomparable": [i for i, c in enumerate(per) if c is None], "per_frame": per}
+
+
+def similar_group_detail(rows: dict, members: list[int]) -> dict:
+    """グループ全体の場面の一致状況。どれか1組でも一致しない場面は「一致しない」として数える。"""
+    unmatched, uncomparable, matched_all = set(), set(), None
+    for i, a in enumerate(members):
+        for b in members[i + 1:]:
+            d = similar_pair_detail(rows[a], rows[b])
+            unmatched |= set(d["unmatched"])
+            uncomparable |= set(d["uncomparable"])
+            matched_all = set(d["matched"]) if matched_all is None else matched_all & set(d["matched"])
+    uncomparable -= unmatched
+    matched = (matched_all or set()) - unmatched - uncomparable
+    text = (f"代表場面 {similar.N_POINTS} のうち {len(matched)} が一致、{len(unmatched)} が一致しない、"
+            f"{len(uncomparable)} が比較できない（{LIMITS_NOTE}）")
+    return {"matched": sorted(matched), "unmatched": sorted(unmatched), "uncomparable": sorted(uncomparable),
+            "text": text}
+
+
+def keep_for_similar_videos(rows, detail: dict | None = None) -> tuple[int | None, str]:
     """類似録画の「残すおすすめ」。明確な優劣がなければ決めない（None）。
 
     解像度だけで高画質とは断定しない。保護したものがあれば、それを残す。
+    一致しない場面があるときは、内容が違う可能性があるので、おすすめを決めない。
     """
     protected = [r for r in rows if r["protected"]]
     if protected:
@@ -481,6 +521,9 @@ def keep_for_similar_videos(rows) -> tuple[int | None, str]:
     kept = [r for r in rows if r["decision"] == "残す"]
     if len(kept) == 1:
         return kept[0]["id"], "「残す」を選んだ録画です"
+    if detail and detail["unmatched"]:
+        return None, (f"一致しない場面が {len(detail['unmatched'])} あり、内容が違う可能性があるため、"
+                      "おすすめを決めません。比較して確認してください")
     best = max(rows, key=pixels)
     others = [r for r in rows if r is not best]
     durs = [duration(r) or 0 for r in rows]
@@ -676,6 +719,12 @@ def _fmt(n: int) -> str:
     return format_size(n)
 
 
+def _pair_text(a_row, b_row) -> str:
+    d = similar_pair_detail(a_row, b_row)
+    return (f"代表場面 {similar.N_POINTS} のうち {len(d['matched'])} が一致、{len(d['unmatched'])} が一致しない、"
+            f"{len(d['uncomparable'])} が比較できない（{LIMITS_NOTE}）")
+
+
 class _LazyExists:
     """必要になったファイルだけ存在を確認して覚えておく。"""
 
@@ -793,7 +842,8 @@ def plan_recordings(ctx: Context, target_bytes: int | None, include_images: bool
             similar_items.append({
                 "id": m, "kind": "similar", "label": "類似（要比較）", "size": rows[m]["size"], "keep_id": keep_id,
                 "group": n, "confirmed": confirmed is not None,
-                "reasons": [f"「{all_rows[keep_id]['name']}」と長さがほぼ同じで、代表場面の大半が一致します"
+                "reasons": [f"「{all_rows[keep_id]['name']}」と長さがほぼ同じです。"
+                            f"{_pair_text(all_rows[keep_id], all_rows[m])}"
                             f"（同じ内容とは限りません）。{why}"
                             + ("" if confirmed else "。比較して残す1本を確定すると、選べるようになります")]})
     similar_items.sort(key=lambda it: -it["size"])

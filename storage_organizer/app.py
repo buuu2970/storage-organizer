@@ -38,6 +38,15 @@ def install_error_log(data_dir) -> None:
     log_dir = Path(data_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "recsort-error.log"
+    try:  # Python の例外にならない異常終了（Windows の API の中など）でも、どこで落ちたかを残す
+        import faulthandler
+        crash = log_dir / "recsort-crash.log"
+        if crash.exists() and crash.stat().st_size > 1024 * 1024:
+            crash.unlink()
+        install_error_log._crash_fh = open(crash, "a", encoding="utf-8")
+        faulthandler.enable(file=install_error_log._crash_fh, all_threads=True)
+    except OSError:
+        pass
     shown = {"done": False}
 
     def hook(exc_type, exc, tb):
@@ -50,6 +59,11 @@ def install_error_log(data_dir) -> None:
                 f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} RecSort {__version__}\n{text}\n")
         except OSError:
             pass
+        from .store import StoreError
+        if issubclass(exc_type, StoreError) and QApplication.instance() is not None:
+            from PySide6.QtWidgets import QMessageBox  # 保存の失敗は、成功したように見せずにそのまま伝える
+            QMessageBox.warning(None, "RecSort", f"保存できませんでした。\n{exc}")
+            return
         if not shown["done"] and QApplication.instance() is not None:
             shown["done"] = True
             from PySide6.QtWidgets import QMessageBox
@@ -63,10 +77,22 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
-    from .store import default_data_dir
-    install_error_log(default_data_dir())
+    from .instance_lock import AlreadyRunning, InstanceLock
+    from .store import Store, default_data_dir
+    data_dir = default_data_dir()
     install_japanese(app)
     theme.apply(app)
-    window = MainWindow()
+    try:  # 保存データを読み書きする前に、二重起動を防ぐロックを取る
+        lock = InstanceLock(data_dir).acquire()
+    except AlreadyRunning:
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.warning(None, "RecSort", "RecSort はすでに起動しています。\n"
+                            "保護や判断の記録が食い違わないよう、同時に2つは起動できません。"
+                            "起動中のウィンドウを使ってください。")
+        return 1
+    install_error_log(data_dir)
+    window = MainWindow(Store(data_dir))
     window.show()
-    return app.exec()
+    code = app.exec()
+    lock.release()
+    return code

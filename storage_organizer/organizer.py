@@ -10,11 +10,12 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 from functools import partial
 
 from PySide6.QtCore import (QAbstractTableModel, QItemSelectionModel, QModelIndex, QObject, QRectF, QRunnable,
                             QSize, Qt, QThread, QThreadPool, QTimer, Signal)
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QImageReader, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImageReader, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMenu, QMessageBox,
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import autoscan, candidates, media, theme, trash
-from .store import Store as Database, loads
+from .store import Store as Database, StoreError, loads
 from .formatting import format_bytes_exact, format_size
 from .scan_worker import TaskWorker
 
@@ -530,16 +531,19 @@ class MediaState(QObject):
         """判断を記録する。「保護する」が付いたものは削除候補にしない。スキップ件数を返す。"""
         name = DECISION_ALIASES.get(name, name)
         skipped = 0
-        for mid in ids:
-            if name == "保護する":
-                self.db.set_protected(mid, True)
-            elif name == "保護を解除":
-                self.db.set_protected(mid, False)
-            else:
-                try:
-                    self.db.set_decision(mid, None if name == "判断を解除" else name)
-                except PermissionError:
-                    skipped += 1
+        try:
+            for mid in ids:
+                if name == "保護する":
+                    self.db.set_protected(mid, True)
+                elif name == "保護を解除":
+                    self.db.set_protected(mid, False)
+                else:
+                    try:
+                        self.db.set_decision(mid, None if name == "判断を解除" else name)
+                    except PermissionError:
+                        skipped += 1
+        except StoreError as e:  # 保存できなかった判断は、成功したように見せずにその場で伝える
+            QMessageBox.warning(None, "保存できませんでした", str(e))
         self.refresh()
         return skipped
 
@@ -557,7 +561,7 @@ class MediaState(QObject):
         if running:
             if info.get("phase") == "scan":
                 return {"kind": "調査中", "icon": "search",
-                        "text": f"調査中 · {info.get('location', '')} · 検出 {info.get('found', 0):,} 件・"
+                        "text": f"ファイルを探しています · {info.get('location', '')} · 見つけた画像・動画 {info.get('found', 0):,} 件・"
                                 f"{format_size(info.get('bytes', 0))}",
                         "tooltip": f"調べている場所: {info.get('current', '')}\n全体の件数は調べ終わるまで分かりません"}
             if info.get("text"):
@@ -567,9 +571,11 @@ class MediaState(QObject):
         last = db.get_setting("scan_finished")
         if last is None and not self.ctx.rows:
             return {"kind": "未調査", "icon": "info", "text": "まだ調査していません"}
-        if (self.last_result or {}).get("cancelled") or unfinished:
+        analysis = db.get_setting("analysis_state")
+        if (self.last_result or {}).get("cancelled") or unfinished or analysis in ("running", "cancelled"):
+            extra = "（重複・類似の確認が途中です）" if analysis in ("running", "cancelled") and not unfinished else ""
             return {"kind": "中断", "icon": "warning",
-                    "text": "調査を中断しました。途中までの結果を表示しています"}
+                    "text": f"調査を中断しました{extra}。途中までの結果を表示しています。「再スキャン」で調べ直せます"}
         when = candidates.format_date(float(last)) if last else "-"
         if skips:
             return {"kind": "一部を調査できなかった", "icon": "warning",
@@ -642,8 +648,8 @@ class EmptyState(QWidget):
 
 
 INFO_HELP = ("「残す」はこのファイルを整理しないという判断の記録です。\n"
-             "「保護する」を付けると、整理のおすすめ・削除候補・ごみ箱への移動から常に除外します。\n"
-             "「削除候補にする」はファイルを削除しません。ごみ箱へ移すのは「整理のおすすめ」の「削除候補」から行います。")
+             "「保護する」を付けると、次回以降も整理の対象から守ります（おすすめ・整理予定・ごみ箱への移動から除外）。\n"
+             "「整理予定に入れる」だけではファイルは移動しません。ごみ箱へ移すのは、最終確認で確定したときだけです。")
 
 
 class SelectionBar(QFrame):
@@ -661,8 +667,8 @@ class SelectionBar(QFrame):
         h.addStretch()
         self.keep = button("残す", None, "check", "整理しないという判断を記録します")
         self.hold = button("保留", None, "pause", "あとで判断します。「保留」はファイル一覧で絞り込めます")
-        self.delete = button("削除候補にする", None, "flag",
-                             "まだ削除しません。ごみ箱へ移すのは「整理のおすすめ」の「削除候補」から行います")
+        self.delete = button("整理予定に入れる", None, "flag",
+                             "まだ移動しません。ごみ箱へ移すのは、最終確認で確定したときだけです")
         self.protect = button("保護する", None, "shield", "整理のおすすめ・ごみ箱への移動から常に除外します")
         self.more = QToolButton()
         self.more.setText("その他")
@@ -777,7 +783,7 @@ class DetailPanel(QFrame):
         self.decision = label("", None, wrap=True)
         self.decision_section.v.addWidget(self.decision)
         self.decision_section.v.addWidget(label("判断は上の操作バーで変更できます。"
-                                                "「削除候補にする」だけではファイルは削除されません。", "caption", wrap=True))
+                                                "「整理予定に入れる」だけではファイルは移動しません。", "caption", wrap=True))
         for w in (self.preview_section, self.info_section, self.reason_section, self.decision_section):
             bv.addWidget(w)
         bv.addStretch()
@@ -790,7 +796,7 @@ class DetailPanel(QFrame):
         self.multi_text = label("", None, wrap=True)
         self.multi_section.v.addWidget(self.multi_text)
         row = QHBoxLayout()
-        for name, text, ic in (("残す", "残す", "check"), ("保留", "保留", "pause"), ("削除候補", "削除候補にする", "flag")):
+        for name, text, ic in (("残す", "残す", "check"), ("保留", "あとで決める", "pause"), ("削除候補", "整理予定に入れる", "flag")):
             b = button(text, None, ic)
             b.clicked.connect(partial(browser.apply_decision, name))
             row.addWidget(b)
@@ -853,10 +859,10 @@ class DetailPanel(QFrame):
                              else "整理候補になる理由は見つかりませんでした。")
         state = "保護中" if r["protected"] else (r["decision"] or "未判断")
         explain = {
-            "保護中": "整理のおすすめ・削除候補・ごみ箱への移動から常に除外します。",
+            "保護中": "次回以降も整理の対象から守ります（おすすめ・整理予定・ごみ箱への移動から除外）。",
             "残す": "整理しないと判断しました（保護とは違い、目標容量の提案などからは除外のみ）。",
             "保留": "あとで判断します。ファイル一覧の「保留」で確認できます。",
-            "削除候補": "ごみ箱へ移す候補です。まだ削除していません。「整理のおすすめ」→「削除候補」から確認して移動できます。",
+            "削除候補": "整理予定です。まだ移動していません。「整理する」→最終確認で、ごみ箱へ移すかを確定します。",
             "未判断": "まだ判断していません。",
         }[state]
         extra = f"（判断: {r['decision']}）" if r["protected"] and r["decision"] else ""
@@ -913,7 +919,7 @@ class DetailPanel(QFrame):
         self.multi_text.setText(f"合計 {format_size(sum(r['size'] for r in rows))}<br>"
                                 f"画像 {images:,} 件・動画 {len(rows) - images:,} 件<br>"
                                 f"保護中 {sum(1 for r in rows if r['protected']):,} 件"
-                                "（保護中のファイルは削除候補にしません）")
+                                "（保護中のファイルは整理予定にしません）")
         self.media_id = None
 
     def show_group(self, category: str, key) -> None:
@@ -928,26 +934,33 @@ class DetailPanel(QFrame):
 # ファイル一覧 / 整理のおすすめ（共通の一覧画面）
 # =============================================================================
 RECOMMEND_TABS = [("重複", "完全重複"), ("類似画像", "類似画像"), ("録画確認候補", "録画確認候補"),
-                  ("大容量", "大容量"), ("削除候補", "削除候補")]
+                  ("大容量", "大容量"), ("削除候補", "整理予定")]
 RECOMMEND_HELP = {
     "重複": "内容が完全に一致するファイルです（SHA-256 で確認）。1つは残す前提で比較してください。",
     "類似画像": "縮小版・連写・軽い編集違いなど、似ている画像です（完全一致ではありません）。",
     "録画確認候補": "極端に短い・ほぼ真っ暗・読み込めない・破損の可能性があるファイルです。プレビューで確認してください。",
     "大容量": "100MB 以上のファイルです。容量が大きいだけで整理候補とは判断しません。",
-    "削除候補": "「削除候補にする」を付けたファイルです。確認してからごみ箱へ移動できます（完全削除はしません）。",
+    "削除候補": "整理予定に入れたファイルです。最終確認でごみ箱へ移すかを確定します（完全削除はしません）。",
 }
 EMPTY_HELP = {
     "重複": "内容が完全に一致するファイルは見つかりませんでした。",
     "類似画像": "似ている画像のグループは見つかりませんでした。",
     "録画確認候補": "失敗した可能性のある録画・画像は見つかりませんでした。",
     "大容量": "100MB 以上のファイルは見つかりませんでした。",
-    "削除候補": "まだ削除候補はありません。一覧でファイルを選び「削除候補にする」を押すと、ここに集まります。",
+    "削除候補": "整理予定のファイルはまだありません。比較して「これを残す」を選ぶと、ほかのコピーがここに入ります。",
 }
-STATE_FILTERS = ["すべての判断", "未判断", "残す", "保留", "削除候補", "保護中"]
+# (表示名, 保存データの値)。保存データの値は以前の版との互換のため変えない
+STATE_FILTERS = [("すべて", "すべての判断"), ("まだ決めていない", "未判断"), ("残す", "残す"), ("あとで決める", "保留"),
+                 ("整理予定", "削除候補"), ("保護中", "保護中")]
 
 
 class MediaBrowser(QWidget):
-    """mode="files"（ファイル一覧）または "recommend"（整理のおすすめ）。"""
+    """mode="files"（ファイルを見る）または "recommend"（画像の整理・補助）。"""
+
+    def add_header_link(self, text: str, fn) -> None:
+        b = button(text, "link")
+        b.clicked.connect(fn)
+        self._head.insertWidget(1, b, 0, Qt.AlignmentFlag.AlignTop)
 
     request_locations = Signal()
     request_files = Signal()
@@ -964,7 +977,7 @@ class MediaBrowser(QWidget):
         head = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
-        self.title = label("ファイル一覧" if mode == "files" else "その他の整理（画像など）", "title")
+        self.title = label("ファイルを見る" if mode == "files" else "画像の整理（補助）", "title")
         self.help = label("", "sub", wrap=True)
         title_box.addWidget(self.title)
         title_box.addWidget(self.help)
@@ -972,9 +985,13 @@ class MediaBrowser(QWidget):
         self.target_button = button("目標容量から提案", None, "target",
                                     "「20GB空けたい」などの目標から、整理候補の組み合わせを提案します")
         self.trash_button = button("ごみ箱へ移動…", "danger", "trash",
-                                   "削除候補を確認してから Windows のごみ箱へ移動します（完全削除はしません）")
+                                   "整理予定を確認してから Windows のごみ箱へ移します（完全削除はしません）")
         head.addWidget(self.target_button, 0, Qt.AlignmentFlag.AlignTop)
         head.addWidget(self.trash_button, 0, Qt.AlignmentFlag.AlignTop)
+        self._head = head
+        if mode == "files":  # 整理は「整理する」の流れで行う（赤いボタンは実際に移す操作だけに使う）
+            self.target_button.hide()
+            self.trash_button.hide()
         v.addLayout(head)
         self.tabs = QTabBar()
         self.tabs.setExpanding(False)
@@ -994,7 +1011,8 @@ class MediaBrowser(QWidget):
         self.kind_filter = QComboBox()
         self.kind_filter.addItems(["画像と動画", "画像のみ", "動画のみ"])
         self.state_filter = QComboBox()
-        self.state_filter.addItems(STATE_FILTERS)
+        for text, value in STATE_FILTERS:
+            self.state_filter.addItem(text, value)
         self.state_filter.setVisible(mode == "files")
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(SORTS)
@@ -1103,7 +1121,8 @@ class MediaBrowser(QWidget):
         else:
             self.category = "すべて"
             mapping = {"保護": "保護中", "保留": "保留", "削除候補": "削除候補", "すべて": "すべての判断"}
-            self.state_filter.setCurrentText(mapping.get(category, "すべての判断"))
+            idx = self.state_filter.findData(mapping.get(category, "すべての判断"))
+            self.state_filter.setCurrentIndex(max(idx, 0))
         self.refresh()
 
     def _on_tab(self, index: int) -> None:
@@ -1148,7 +1167,7 @@ class MediaBrowser(QWidget):
         if kind:
             rows = [r for r in rows if r["kind"] == kind]
         if self.mode == "files" and self.state_filter.currentIndex() > 0:
-            want = self.state_filter.currentText()
+            want = self.state_filter.currentData()
             rows = [r for r in rows if decision_text(r) == want or (want == "未判断" and decision_text(r) == "未判断")]
         rows = sort_rows(rows, self.sort_combo.currentText())
         if self.mode == "recommend" and self.category in ("重複", "類似画像"):
@@ -1162,7 +1181,7 @@ class MediaBrowser(QWidget):
         count = len({m for r in rows for m in (r.get("members") or [r["id"]])})
         total = sum(r["size"] for r in rows)
         self.footer.setText(f"{count:,} 件 · {format_size(total)}"
-                            + (f" · 削除候補 {len(trash_rows):,} 件（{format_size(sum(r['size'] for r in trash_rows))}）"
+                            + (f" · 整理予定 {len(trash_rows):,} 件（{format_size(sum(r['size'] for r in trash_rows))}）"
                                if trash_rows else ""))
         self._show_content()
         view = self.active_view()
@@ -1275,7 +1294,7 @@ class MediaBrowser(QWidget):
         ids = ids if ids is not None else self.selected_ids()
         skipped = self.state.decide(name, ids)
         if skipped:
-            QMessageBox.information(self, "判断", f"保護中の {skipped} 件は削除候補にしませんでした。")
+            QMessageBox.information(self, "判断", f"保護中の {skipped} 件は整理予定にしませんでした。")
 
     def open_location(self) -> None:
         ids = self.selected_ids()
@@ -1372,8 +1391,11 @@ class HomePage(QWidget):
         self.banner = FFmpegBanner(state.tools_fn)
         self.banner.open_settings.connect(self.request_settings.emit)
         v.addWidget(self.banner)
+        self.data_banner = DataProblemBanner(state.db)
+        self.data_banner.open_settings.connect(self.request_settings.emit)
+        v.addWidget(self.data_banner)
         actions = QHBoxLayout()
-        self.scan_button = button("PCを調べる", None, "search", "調べる範囲（ドライブ・フォルダ）を確認して調査を始めます")
+        self.scan_button = button("PCをもう一度調べる", None, "search", "調べる範囲（ドライブ・フォルダ）を確認して調査を始めます")
         self.primary = button("おすすめを確認する", "primary", "sparkle")
         self.primary.setMinimumHeight(36)
         actions.addWidget(self.primary)
@@ -1398,14 +1420,14 @@ class HomePage(QWidget):
         grid.setSpacing(theme.S2)
         self.free = StatCard("ドライブの空き容量（実際）", "drive")
         self.total = StatCard("調査済みの録画", "film")
-        self.goal = card_frame()
+        self.goal = card_frame()  # 任意の目標容量
         gv = QVBoxLayout(self.goal)
         gv.setContentsMargins(theme.S2, theme.S2, theme.S2, theme.S2)
         gh = QHBoxLayout()
         ic = QLabel()
         ic.setPixmap(theme.pixmap("target", theme.ACCENT, 18))
         gh.addWidget(ic)
-        gh.addWidget(label("目標容量から整理する（任意）", "sub"), 1)
+        gh.addWidget(label("追加で空けたい容量（任意）", "sub"), 1)
         gv.addLayout(gh)
         row = QHBoxLayout()
         self.target = QDoubleSpinBox()
@@ -1431,7 +1453,10 @@ class HomePage(QWidget):
         self.saving = StatCard("完全一致の重複（同じ録画が残ります）", "copy")
         self.images = StatCard("画像（補助機能）", "image")
         self.grid = grid
-        self.cards = [self.free, self.total, self.goal, self.usage, self.saving, self.images]
+        # 数字のカードは 3 枚に絞る（録画の合計・重複分・画像の件数は表示しない。値は更新し続ける）
+        self.cards = [self.free, self.goal, self.usage]
+        for extra in (self.total, self.saving, self.images):
+            extra.hide()
         self._cols = 0
         self._relayout(3)
         v.addLayout(grid)
@@ -1473,14 +1498,20 @@ class HomePage(QWidget):
 
     def refresh_status(self) -> None:
         self.banner.update_state()
+        self.data_banner.update_state()
         st = self.state.scan_state()
         has = self.state.has_data()
         scanning = st["kind"] in ("調査中", "一時停止中")
-        self.primary.setText("おすすめを確認する" if has else ("調査中…" if scanning else "PCを調べる"))
+        self.primary.setText("おすすめを確認する" if has else ("調査中…" if scanning else "PCの容量を調べる"))
         self.primary.setIcon(theme.icon("sparkle" if has else "search", "#FFFFFF", 16))
         self.primary.setEnabled(has or not scanning)
         self.scan_button.setVisible(has)
         self.scan_button.setEnabled(not scanning)
+        # 初回は「PCの容量を調べる」と空き容量だけを見せ、まだ使えない欄は出さない
+        self.rec.setVisible(has or scanning)
+        self.goal.setVisible(has)
+        self.usage.setVisible(has or scanning)
+        self.primary.setMinimumHeight(44 if not has else 36)
         self.goal_button.setEnabled(has)
         db = self.state.db
         labels = [x["label"] for x in db.locations()]
@@ -1502,8 +1533,8 @@ class HomePage(QWidget):
             self.total.set("調査中")
             self.saving.set("算出中")
         else:
-            self.lead.setText("PC内のファイルを調べて、何が容量を使っているかと、重複・類似する録画を見つけます。"
-                              "まず「PCを調べる」から調べる範囲を確認してください。")
+            self.lead.setText("PC内のファイルを調べて、何が容量を使っているかと、同じ録画・似た録画を見つけます。"
+                              "まず「PCの容量を調べる」を押して、調べる範囲を確認してください（ファイルは変更しません）。")
 
     def refresh(self) -> None:
         ctx = self.state.ctx
@@ -1776,6 +1807,62 @@ class FFmpegBanner(QFrame):
         self.setVisible(not self.tools_fn().available)
 
 
+PLAN_THUMB_W, PLAN_THUMB_H = 96, 54
+
+
+def _framed_thumb(pm: QPixmap | None, row, state: str = "pending") -> QPixmap:
+    """サムネイルを同じ大きさの暗い枠に収める（縦長などは余白を付ける）。なければ状態を文字で示す。"""
+    canvas = QPixmap(PLAN_THUMB_W, PLAN_THUMB_H)
+    canvas.fill(QColor("#1f1f1f"))
+    painter = QPainter(canvas)
+    if pm is not None and not pm.isNull():
+        fit = pm.scaled(PLAN_THUMB_W, PLAN_THUMB_H, Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation)
+        painter.drawPixmap((PLAN_THUMB_W - fit.width()) // 2, (PLAN_THUMB_H - fit.height()) // 2, fit)
+    else:
+        painter.setPen(QColor("#d0d0d0"))
+        f = painter.font()
+        f.setPointSizeF(max(f.pointSizeF() * 0.8, 7))
+        painter.setFont(f)
+        text = {"cloud": "オンライン専用", "failed": "サムネイルなし"}.get(state, "準備中")
+        painter.drawText(canvas.rect(), Qt.AlignmentFlag.AlignCenter, text)
+    painter.end()
+    return canvas
+
+
+class DataProblemBanner(QFrame):
+    """保存データの一部を読み込めなかったことを知らせる（保護情報が読めないときは整理操作を止めている）。"""
+
+    open_settings = Signal()
+
+    def __init__(self, db) -> None:
+        super().__init__()
+        self.setObjectName("SelectionBar")
+        self.db = db
+        h = QHBoxLayout(self)
+        h.setContentsMargins(theme.S1, 4, theme.S1, 4)
+        ic = QLabel()
+        ic.setPixmap(theme.pixmap("warning", theme.WARN, 16))
+        h.addWidget(ic)
+        self.text = label("", None, wrap=True)
+        h.addWidget(self.text, 1)
+        b = button("設定を開く", None, "settings")
+        b.clicked.connect(self.open_settings.emit)
+        h.addWidget(b)
+        self.update_state()
+
+    def update_state(self) -> None:
+        problems = self.db.load_problems
+        if not problems:
+            self.hide()
+            return
+        head = ("保護・判断の記録を読み込めなかったため、ごみ箱への移動などの整理操作を止めています。調査と確認はできます。"
+                if not self.db.protection_ok else "保存データの一部を読み込めませんでした（復旧済み、または作り直します）。")
+        self.text.setText(head + " " + " / ".join(problems[:2]) + (f" ほか {len(problems) - 2} 件" if len(problems) > 2 else ""))
+        self.setToolTip("\n".join(problems))
+        self.show()
+
+
 class PlanPage(QWidget):
     """候補を確認: 重複・類似録画をグループ単位で示す。目標容量（追加で空けたい容量）は任意。"""
 
@@ -1794,13 +1881,16 @@ class PlanPage(QWidget):
         v.setContentsMargins(theme.S3, theme.S2, theme.S3, theme.S1)
         v.setSpacing(theme.S1)
         v.addWidget(StepBar(0))
-        v.addWidget(label("候補を確認", "title"))
+        v.addWidget(label("おすすめを見る", "title"))
         self.help = label("完全一致の重複と、解像度・圧縮が違う類似録画をグループで示します（決まったルールによる提案で、"
                           "AI の判定ではありません）。グループを選んで「比較して選ぶ」で残す1本を確認できます。", "sub", wrap=True)
         v.addWidget(self.help)
         self.banner = FFmpegBanner(state.tools_fn)
         self.banner.open_settings.connect(self.request_settings.emit)
         v.addWidget(self.banner)
+        self.data_banner = DataProblemBanner(state.db)
+        self.data_banner.open_settings.connect(self.request_settings.emit)
+        v.addWidget(self.data_banner)
         row = QHBoxLayout()
         row.addWidget(label("追加で空けたい容量（任意）"))
         self.target = QDoubleSpinBox()
@@ -1837,8 +1927,12 @@ class PlanPage(QWidget):
         self.tree.setColumnWidth(1, 90)
         self.tree.setColumnWidth(2, 380)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.tree.setUniformRowHeights(True)
+        # 一覧を出した時点でサムネイルが見えるようにする（行ごとに高さが違うので、高さの統一はしない）
+        self.tree.setIconSize(QSize(PLAN_THUMB_W, PLAN_THUMB_H))
+        self.tree.setUniformRowHeights(False)
         self.tree.setTextElideMode(Qt.TextElideMode.ElideRight)  # 理由の全文は詳細とツールチップで確認できる
+        self._thumb_items: dict[int, list[QTreeWidgetItem]] = {}
+        state.loader.updated.connect(self._on_thumb)
         self.empty = EmptyState()
         self.content = QStackedWidget()
         self.content.addWidget(self.tree)
@@ -1957,6 +2051,7 @@ class PlanPage(QWidget):
         found = False
         self.tree.blockSignals(True)
         self.tree.clear()
+        self._thumb_items = {}
         groups: dict[tuple, list[dict]] = {}
         for it in self.plan["items"]:
             if it["kind"] == "duplicate":
@@ -1996,7 +2091,7 @@ class PlanPage(QWidget):
                                         keep["folder"]])
                 krow.setData(0, Qt.ItemDataRole.UserRole + 2, keep["id"])
                 krow.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                krow.setIcon(0, theme.icon("check" if confirmed else "info", theme.OK if confirmed else theme.TEXT_SUB, 16))
+                self._set_thumb(krow, keep)
                 top.addChild(krow)
             for it in items:
                 r = ctx.rows[it["id"]]
@@ -2009,7 +2104,7 @@ class PlanPage(QWidget):
                 child.setCheckState(0, Qt.CheckState.Checked if self._checks.get(it["id"]) else Qt.CheckState.Unchecked)
                 child.setToolTip(0, r["path"])
                 child.setToolTip(2, "\n".join(it["reasons"]))
-                child.setIcon(0, theme.icon("film" if r["kind"] == "video" else "image", theme.TEXT_SUB, 16))
+                self._set_thumb(child, r)
                 top.addChild(child)
                 if it["id"] == current:
                     self.tree.setCurrentItem(child)
@@ -2020,6 +2115,30 @@ class PlanPage(QWidget):
             self.detail.player.stop()
             self.detail.hide()
         self._show_content()
+
+    def _set_thumb(self, item: QTreeWidgetItem, row) -> None:
+        """行にサムネイルを付ける。まだなければ「準備中」を置き、できしだい差し替える。"""
+        self._thumb_items.setdefault(row["id"], []).append(item)
+        rd = row_dict(row, self.state.ctx)
+        pm = self.state.loader.pixmap(rd)
+        item.setIcon(0, QIcon(_framed_thumb(pm, row, self.state.loader.state(rd))))
+        item.setData(0, Qt.ItemDataRole.UserRole + 3, self.state.loader.state(rd))
+
+    def _on_thumb(self, media_id: int) -> None:
+        items = self._thumb_items.get(media_id)
+        row = self.state.ctx.rows.get(media_id)
+        if not items or row is None:
+            return
+        rd = row_dict(row, self.state.ctx)
+        pm = self.state.loader.pixmap(rd)
+        st = self.state.loader.state(rd)
+        icon = QIcon(_framed_thumb(pm, row, st))
+        for item in items:
+            try:
+                item.setIcon(0, icon)
+                item.setData(0, Qt.ItemDataRole.UserRole + 3, st)
+            except RuntimeError:
+                pass  # 一覧を作り直した後に届いた通知は無視する
 
     def _show_content(self) -> None:
         if self.plan["items"]:
@@ -2101,13 +2220,15 @@ class PlanPage(QWidget):
         total = sum(ctx.rows[i]["size"] for i in ids if i in ctx.rows)
         target = self.plan["target"] if self.plan else None
         rest = max(target - total, 0) if target else 0
+        self.data_banner.update_state()
         self.selected_label.setText(f"選択中 {len(ids):,} 本・{format_size(total)}"
                                     + ("" if target is None else (f"（目標まであと {format_size(rest)}）" if rest
                                                                   else "（目標に届きます）")))
-        self.final_button.setEnabled(bool(ids))
+        self.final_button.setEnabled(bool(ids) and self.state.db.protection_ok)  # 保護情報が読めないときは止める
         mid = self._current_id()
-        self.protect_button.setEnabled(bool(mid))
-        self.keep_button.setEnabled(bool(mid))
+        editable = self.state.db.protection_ok  # 保護・判断の記録が復旧待ちのときは変更できない
+        self.protect_button.setEnabled(bool(mid) and editable)
+        self.keep_button.setEnabled(bool(mid) and editable)
         self.compare_button.setEnabled(self._current_group() is not None)
 
     def _on_check(self, item, column) -> None:
@@ -2191,6 +2312,8 @@ class PlanPage(QWidget):
         self.help.setVisible(not compact)
         self.note.setVisible(not compact)
         self.detail.player.setMinimumHeight(160 if compact else 220)  # 狭い画面でも再生の操作まで届くように
+        # 低い画面ではサムネイルを小さくして、一覧に入る行数を増やす
+        self.tree.setIconSize(QSize(64, 36) if compact else QSize(PLAN_THUMB_W, PLAN_THUMB_H))
         for card in (self.status_card, self.total_card, self.free_card):
             card.detail.setVisible(not compact)
             card.setToolTip(card.detail.text() if compact else "")
@@ -2212,10 +2335,15 @@ class PlanPage(QWidget):
         self.detail.player.stop()
 
 
+def similar_n() -> int:
+    from . import similar
+    return similar.N_POINTS
+
+
 class StepBar(QWidget):
     """「候補を確認 → 比較して選ぶ → 最終確認」の進行状態（文字とアイコンで示し、色だけに頼らない）。"""
 
-    STEPS = ("候補を確認", "比較して選ぶ", "最終確認")
+    STEPS = ("おすすめを見る", "残すものを選ぶ", "最終確認")
 
     def __init__(self, current: int) -> None:
         super().__init__()
@@ -2260,14 +2388,15 @@ class PlayerDialog(QDialog):
 
 
 class _FramesJob(QRunnable):
-    def __init__(self, page, media_id, path, duration, prefix, tools):
+    def __init__(self, page, media_id, path, duration, prefix, tools, fractions):
         super().__init__()
         self.page, self.media_id, self.path, self.duration, self.prefix, self.tools = \
             page, media_id, path, duration, prefix, tools
+        self.fractions = fractions
 
     def run(self):
         try:
-            paths = media.compare_frames(self.tools, self.path, self.duration, self.prefix)
+            paths = media.compare_frames(self.tools, self.path, self.duration, self.prefix, fractions=self.fractions)
         except Exception:
             paths = []
         self.page.frames_ready.emit(self.media_id, paths)
@@ -2296,17 +2425,43 @@ class ComparePage(QWidget):
         self.reason = label("", "sub", wrap=True)
         v.addWidget(self.title)
         v.addWidget(self.reason)
+        pick = QHBoxLayout()
+        self.pick_label = label("比較する2本:", "sub")
+        self.left_combo, self.right_combo = QComboBox(), QComboBox()
+        for c in (self.left_combo, self.right_combo):
+            c.setMinimumWidth(220)
+            c.activated.connect(self._pick_changed)
+        pick.addWidget(self.pick_label)
+        pick.addWidget(self.left_combo)
+        pick.addWidget(label("と", "sub"))
+        pick.addWidget(self.right_combo)
+        pick.addStretch()
+        self.pick_row = QWidget()
+        self.pick_row.setLayout(pick)
+        v.addWidget(self.pick_row)
+        self.result_bar = QFrame()
+        self.result_bar.setObjectName("SelectionBar")
+        rb = QHBoxLayout(self.result_bar)
+        rb.setContentsMargins(theme.S1, 4, theme.S1, 4)
+        self.result_text = label("", None, wrap=True)
+        self.undo_button = button("取り消す", None, "undo", "直前の判断を取り消して、選び直せるようにします")
+        self.undo_button.clicked.connect(self.undo)
+        rb.addWidget(self.result_text, 1)
+        rb.addWidget(self.undo_button)
+        self.result_bar.hide()
+        v.addWidget(self.result_bar)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         v.addWidget(self.scroll, 1)
         bar = QHBoxLayout()
-        self.back_button = button("候補へ戻る", None, "undo")
-        self.keep_all = button("すべて残す（両方残す）", None, "check", "このグループの録画をすべて残し、候補から外します")
-        self.hold = button("保留", None, "pause", "あとで判断します。候補からいったん外れます")
+        self.back_button = button("おすすめへ戻る", None, "undo")
+        self.keep_all = button("両方残す", None, "check", "このグループの録画をすべて残し、候補から外します")
+        self.keep_pair = button("比較中の2本を残す", None, "check", "いま並べている2本を残します（ほかの録画はそのまま）")
+        self.hold = button("あとで決める", None, "pause", "このグループの判断をあとにします。候補からいったん外れます")
         self.next_button = button("最終確認へ", "primary", "flag")
         bar.addWidget(self.back_button)
         bar.addStretch()
-        for b in (self.keep_all, self.hold, self.next_button):
+        for b in (self.keep_pair, self.keep_all, self.hold, self.next_button):
             bar.addWidget(b)
         v.addLayout(bar)
         v.addWidget(label("比較中はファイルを変更・移動しません。ごみ箱へ移すのは、最終確認で確定したときだけです。",
@@ -2314,7 +2469,10 @@ class ComparePage(QWidget):
         self.back_button.clicked.connect(self.back.emit)
         self.next_button.clicked.connect(self.to_final.emit)
         self.keep_all.clicked.connect(lambda: self._decide_all("残す"))
+        self.keep_pair.clicked.connect(self._keep_pair)
         self.hold.clicked.connect(lambda: self._decide_all("保留"))
+        self.pair: list[int] = []
+        self._undo: dict[int, str | None] | None = None
         self.frames_ready.connect(self._on_frames)
 
     def members(self) -> list[int]:
@@ -2328,6 +2486,9 @@ class ComparePage(QWidget):
 
     def show_group(self, kind: str, key) -> None:
         self.group = (kind, key)
+        self.pair = []
+        self.result_bar.hide()
+        self._undo = None
         self.refresh()
 
     def refresh(self) -> None:
@@ -2358,15 +2519,57 @@ class ComparePage(QWidget):
             else:
                 text += f" {why}"
             self.reason.setText(text)
+        # 表示する場面: 類似は「一致しない → 比較できない → 一致」の順に4つ。完全一致は 20/40/60/80%
+        if kind == "similar":
+            det = ctx.vgroup_detail[key]
+            order = ([(i, "一致しない場面") for i in det["unmatched"]] + [(i, "比較できない場面") for i in det["uncomparable"]]
+                     + [(i, "一致した場面") for i in det["matched"]])
+            self.points = [((i + 0.5) / similar_n(), tag) for i, tag in order[:4]] or \
+                [(f, "場面") for f in media.COMPARE_POINTS]
+            self.points.sort(key=lambda p: ({"一致しない場面": 0, "比較できない場面": 1}.get(p[1], 2), p[0]))
+            warn = (f"⚠ 一致しない場面が {len(det['unmatched'])} あります。内容が違う可能性があります。"
+                    "再生して確認してから選んでください。" if det["unmatched"] else "")
+            self.reason.setText(("" if not warn else warn + "\n") + self.reason.text()
+                                + f"\n{det['text']}。")
+        else:
+            self.points = [(f, "完全一致") for f in media.COMPARE_POINTS]
         box = QWidget()
         h = QHBoxLayout(box)
         h.setSpacing(theme.S1)
         self.frame_labels = {}
         ids = sorted(ids, key=lambda m: (m != keep_id, -candidates.pixels(ctx.rows[m])))
-        for mid in ids:
+        self.all_ids = ids
+        if len(self.pair) != 2 or any(m not in ids for m in self.pair) or self.pair[0] == self.pair[1]:
+            self.pair = ids[:2]
+        many = len(ids) > 2
+        self.pick_row.setVisible(many)
+        if many:  # 3本以上: どの2本を比べているかを取り違えないよう、番号付きで選ぶ
+            for c, chosen in ((self.left_combo, self.pair[0]), (self.right_combo, self.pair[1])):
+                c.blockSignals(True)
+                c.clear()
+                for n, m in enumerate(ids, 1):
+                    c.addItem(f"{n}. {ctx.rows[m]['name']}", m)
+                c.setCurrentIndex(ids.index(chosen))
+                c.blockSignals(False)
+            self.pick_label.setText(f"このグループの {len(ids)} 本から、比較する2本:")
+        self.keep_all.setText("すべて残す" if many else "両方残す")
+        self.keep_all.setToolTip(f"このグループの {len(ids)} 本をすべて残します")
+        self.keep_pair.setVisible(many)
+        durs = {m: candidates.duration(ctx.rows[m]) for m in self.pair}
+        if all(durs.values()) and abs(durs[self.pair[0]] - durs[self.pair[1]]) > 1.0:
+            self.reason.setText(f"⚠ 長さが違います（{format_duration_short(durs[self.pair[0]])} と "
+                                f"{format_duration_short(durs[self.pair[1]])}）。\n" + self.reason.text())
+        for mid in self.pair:
             h.addWidget(self._column(ctx.rows[mid], mid == keep_id))
         h.addStretch()
         self.scroll.setWidget(box)
+        editable = self.state.db.protection_ok
+        self.keep_all.setEnabled(editable)
+        self.keep_pair.setEnabled(editable)
+        self.hold.setEnabled(editable)
+        for b in box.findChildren(QPushButton):
+            if b.text() in ("これを残す", "保護する（次回以降も守る）", "保護を解除"):
+                b.setEnabled(editable)
 
     def _column(self, r, recommended: bool) -> QWidget:
         col = QFrame()
@@ -2392,32 +2595,44 @@ class ComparePage(QWidget):
         v.addWidget(label(" ".join(badges) or "　", None))
         # 操作は上に置く（場面を見るためにスクロールしても、まず操作が見える）
         row = QHBoxLayout()
-        keep = button("これを残す", "primary", "check", "この1本を残し、同じグループのほかの録画を削除候補にします（まだ削除しません）")
+        keep = button("これを残す", "primary", "check", "この1本を残し、ほかを整理予定に入れます（まだ移動しません）")
+        scope = self._keep_scope_text(r["id"])
         play = button("再生", None, "play")
         keep.clicked.connect(partial(self._keep_this, r["id"]))
         play.clicked.connect(partial(self._play, r["id"]))
         play.setEnabled(r["kind"] == "video" and not r["cloud_only"])
         v.addWidget(keep)  # 主な操作は1行に単独で置き、文字が切れないようにする
+        v.addWidget(label(scope, "caption", wrap=True))  # 「これを残す」で何が整理予定に入るか
         row.addWidget(play)
-        prot = button("保護を解除" if r["protected"] else "保護する", None, "shield")
-        prot.clicked.connect(partial(self._protect, r["id"], not r["protected"]))
-        row.addWidget(prot)
+        details = button("詳しい情報", None, "info", "解像度・ビットレート・更新日時・保存場所・保護")
+        details.setCheckable(True)
+        row.addWidget(details)
         v.addLayout(row)
         meta = loads(r["meta"], {}) or {}
         d = candidates.duration(r)
         br = meta.get("bitrate")
-        info = [f"長さ: {format_duration_short(d) or '不明'}",
-                f"解像度: {meta['width']}×{meta['height']}" if meta.get("width") else "解像度: 不明",
-                f"容量: {format_size(r['size'])}",
-                ("ビットレート: " + (f"{br / 1e6:.1f} Mbps" if br >= 1e6 else f"{br / 1e3:.0f} kbps")) if br
-                else "ビットレート: 不明",
-                f"更新日時: {candidates.format_date(r['mtime'])}"]
-        v.addWidget(label("\n".join(info), None))
-        v.addWidget(label(fm.elidedText(r["folder"], Qt.TextElideMode.ElideLeft, 270), "caption"))
+        v.addWidget(label(f"長さ: {format_duration_short(d) or '不明'}　容量: {format_size(r['size'])}", None))
+        extra = [f"解像度: {meta['width']}×{meta['height']}" if meta.get("width") else "解像度: 不明",
+                 ("ビットレート: " + (f"{br / 1e6:.1f} Mbps" if br >= 1e6 else f"{br / 1e3:.0f} kbps")) if br
+                 else "ビットレート: 不明",
+                 f"更新日時: {candidates.format_date(r['mtime'])}",
+                 "保存場所: " + fm.elidedText(r["folder"], Qt.TextElideMode.ElideLeft, 230),
+                 "（解像度だけで画質の良し悪しは決められません）"]
+        more = QWidget()
+        mv = QVBoxLayout(more)
+        mv.setContentsMargins(0, 0, 0, 0)
+        mv.addWidget(label("\n".join(extra), "caption", wrap=True))
+        prot = button("保護を解除" if r["protected"] else "保護する（次回以降も守る）", None, "shield",
+                      "残す判断とは別に、次回以降も整理の対象から守ります")
+        prot.clicked.connect(partial(self._protect, r["id"], not r["protected"]))
+        mv.addWidget(prot)
+        more.hide()
+        details.toggled.connect(more.setVisible)
+        v.addWidget(more)
         labels = []
-        for i, frac in enumerate(media.COMPARE_POINTS):
+        for frac, tag in self.points:
             at = f"（{format_duration_short(d * frac)}）" if d else ""
-            v.addWidget(label(f"{int(frac * 100)}% の場面{at}", "caption"))
+            v.addWidget(label(f"{tag}: {int(frac * 100)}% の位置{at}", "caption"))
             lb = QLabel("読み込み中…")
             lb.setFixedSize(280, 158)
             lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2448,7 +2663,7 @@ class ComparePage(QWidget):
                 lb.setText("場面を表示できません\n（FFmpeg が必要です）" if not tools.available else "長さが不明のため\n場面を表示できません")
             return
         prefix = str(self.state.db.thumb_dir / f"cmp_{r['id']}_{int(r['mtime'])}_{r['size']}")
-        self.pool.start(_FramesJob(self, r["id"], r["path"], duration, prefix, tools))
+        self.pool.start(_FramesJob(self, r["id"], r["path"], duration, prefix, tools, [f for f, _ in self.points]))
 
     def _on_frames(self, mid: int, paths: list) -> None:
         for lb, path in zip(self.frame_labels.get(mid, []), paths):
@@ -2462,25 +2677,92 @@ class ComparePage(QWidget):
             except RuntimeError:
                 pass  # 画面を作り直した後に届いた結果は捨てる
 
+    def _save(self, fn) -> bool:
+        try:
+            fn()
+            return True
+        except StoreError as e:  # 保存できなかった判断は、成功したように見せずにその場で伝える
+            QMessageBox.warning(self, "保存できませんでした", str(e))
+            return False
+        finally:
+            self.state.refresh()
+
+    def _targets_for_keep(self, mid: int) -> list[int]:
+        """「これを残す」で整理予定に入れる録画。完全に同じファイルはほかのコピー全部、
+        似た録画は比較中のもう1本だけ（確認していない録画は入れない）。保護中は入れない。"""
+        kind = self.group[0] if self.group else "duplicate"
+        others = [m for m in self.members() if m != mid] if kind == "duplicate" else \
+            [m for m in self.pair if m != mid]
+        return [m for m in others if not self.state.db.video(m)["protected"]]
+
+    def _keep_scope_text(self, mid: int) -> str:
+        n = len(self._targets_for_keep(mid))
+        if self.group and self.group[0] == "duplicate":
+            return f"ほかのコピー {n} 本を整理予定に入れます（まだ移動しません）"
+        if len(self.members()) > 2:
+            return "比較中のもう1本だけを整理予定に入れます（ほかの録画は未確認のまま）"
+        return "もう1本を整理予定に入れます（まだ移動しません）"
+
+    def _remember(self, ids) -> None:
+        self._undo = {m: self.state.db.video(m)["decision"] for m in ids}
+
+    def _show_result(self, text: str) -> None:
+        self.result_text.setText(text)
+        self.undo_button.setVisible(self._undo is not None)
+        self.result_bar.show()
+
     def _keep_this(self, mid: int) -> None:
-        """この1本を残し、ほかを削除候補にする（保護中は削除候補にしない）。"""
-        for other in self.members():
-            if other == mid:
-                self.state.db.set_decision(other, "残す")
-            elif not self.state.db.video(other)["protected"]:
+        """この1本を残し、対象を整理予定に入れる（まだ移動しない）。結果を表示し、取り消せるようにする。"""
+        targets = self._targets_for_keep(mid)
+        self._remember([mid] + targets)
+
+        def run():
+            self.state.db.set_decision(mid, "残す")
+            for other in targets:
                 self.state.db.set_decision(other, "削除候補")
-        self.state.refresh()
+        if self._save(run):
+            name = self.state.db.video(mid)["name"]
+            self._show_result(f"「{name}」を残します。ほかの {len(targets)} 本を整理予定に追加しました"
+                              "（まだ移動していません。最終確認でごみ箱へ移すかを決めます）")
         self.refresh()
 
     def _decide_all(self, decision: str) -> None:
-        for m in self.members():
-            self.state.db.set_decision(m, decision)
-        self.state.refresh()
-        self.back.emit()
+        ids = self.members()
+        self._remember(ids)
+        if self._save(lambda: [self.state.db.set_decision(m, decision) for m in ids]):
+            self._show_result(f"このグループの {len(ids)} 本をすべて残します" if decision == "残す"
+                              else "このグループは「あとで決める」にしました（候補からいったん外れます）")
+        self.refresh()
+
+    def _keep_pair(self) -> None:
+        ids = list(self.pair)
+        self._remember(ids)
+        if self._save(lambda: [self.state.db.set_decision(m, "残す") for m in ids]):
+            self._show_result("比較中の2本を残します（このグループのほかの録画はそのまま）")
+        self.refresh()
+
+    def undo(self) -> None:
+        """直前の判断を取り消す（判断する前の状態に戻す）。"""
+        if not self._undo:
+            return
+        prev = self._undo
+        if self._save(lambda: [self.state.db.set_decision(m, d) for m, d in prev.items()
+                               if self.state.db.video(m) is not None]):
+            self._undo = None
+            self._show_result("直前の判断を取り消しました。もう一度選べます")
+            self.undo_button.hide()
+        self.refresh()
+
+    def _pick_changed(self) -> None:
+        a, b = self.left_combo.currentData(), self.right_combo.currentData()
+        if a == b:  # 同じ録画は並べない
+            others = [m for m in self.all_ids if m != a]
+            b = others[0]
+        self.pair = [a, b]
+        self.refresh()
 
     def _protect(self, mid: int, value: bool) -> None:
-        self.state.db.set_protected(mid, value)
-        self.state.refresh()
+        self._save(lambda: self.state.db.set_protected(mid, value))
         self.refresh()
 
     def _play(self, mid: int) -> None:
@@ -2527,17 +2809,28 @@ class FinalPage(QWidget):
         v.addWidget(label("移動の直前に、ファイルの存在・変更・保護と、残す側が実在することを確認します。"
                           "ごみ箱へ移しただけでは空き容量は増えません（ごみ箱を空にすると増えます。アプリはごみ箱を空にしません）。",
                           "caption", wrap=True))
+        self.progress = label("", "subtitle", wrap=True)
+        self.progress.hide()
+        v.addWidget(self.progress)
         bar = QHBoxLayout()
         self.back_button = button("戻って選び直す", None, "undo")
-        self.move_button = button("ごみ箱へ移動", "danger", "trash")
+        self.cancel_button = button("中断（ファイル単位）", None, "pause", "いま処理中のファイルが終わったところで止めます")
+        self.cancel_button.hide()
+        self.move_button = button("ごみ箱へ移す", "danger", "trash")
         bar.addWidget(self.back_button)
         bar.addStretch()
+        bar.addWidget(self.cancel_button)
         bar.addWidget(self.move_button)
         v.addLayout(bar)
+        self._worker: TrashWorker | None = None
         self.back_button.clicked.connect(self.back.emit)
         self.move_button.clicked.connect(self.execute)
+        self.cancel_button.clicked.connect(self.cancel)
 
     def prepare(self, ids: list[int]) -> None:
+        if self.is_running():  # 移動中は対象を変えない（画面の表示と実際の処理を食い違わせない）
+            return
+        self.generation = self.state.db.generation  # この確認の根拠になった調査結果の世代
         ctx = self.state.ctx
         self.ids = [i for i in dict.fromkeys(ids) if i in ctx.rows]
         rows = [ctx.rows[i] for i in self.ids]
@@ -2566,18 +2859,97 @@ class FinalPage(QWidget):
                 self.keep_table.setItem(i, j, QTableWidgetItem(val))
         self.keep_table.resizeColumnsToContents()
         problems = candidates.protect_group_rule(ctx, chosen)
-        self.warning.setText("⚠ " + " / ".join(problems) + "（残すおすすめの1本は移動しません）" if problems else "")
-        self.move_button.setEnabled(bool(self.ids))
+        if not self.state.db.protection_ok:
+            problems.insert(0, "保護・判断の記録を読み込めなかったため、整理操作を止めています（設定画面で対処できます）")
+        self.warning.setText("⚠ " + " / ".join(problems) if problems else "")
+        self.move_button.setEnabled(bool(self.ids) and self.state.db.protection_ok)
         self._running = False
 
+    def is_running(self) -> bool:
+        return self._worker is not None
+
     def execute(self) -> None:
-        if getattr(self, "_running", False) or not self.ids:  # 二重実行を防ぐ
+        """別スレッドでごみ箱へ移す（画面は応答し続ける）。二重実行を防ぐ。"""
+        if self._worker is not None or not self.ids:
             return
         self._running = True
         self.move_button.setEnabled(False)
-        results = trash.move_to_trash(self.state.db, self.ids, self.backend)
+        self.back_button.setEnabled(False)
+        self.cancel_button.show()
+        self.cancel_button.setEnabled(True)
+        self.progress.setText(f"ごみ箱へ移動しています… 0 / {len(self.ids)}")
+        self.progress.show()
+        if self.state.runner.is_running():
+            QMessageBox.information(self, "ごみ箱へ移す", "調査中は移動できません。調査が終わってから、もう一度確認してください。")
+            self._running = False
+            self.move_button.setEnabled(True)
+            self.back_button.setEnabled(True)
+            self.cancel_button.hide()
+            self.progress.hide()
+            return
+        self._worker = TrashWorker(self.state.db, list(self.ids), self.backend, getattr(self, "generation", None))
+        self._worker.progress.connect(self._on_progress)
+        self._worker.done.connect(self._on_done)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.start()
+
+    def cancel(self) -> None:
+        """ファイル単位の区切りで止める（移動中のファイルは最後まで処理する）。"""
+        if self._worker is not None:
+            self._worker.cancel_event.set()
+            self.cancel_button.setEnabled(False)
+            self.progress.setText(self.progress.text() + "（中断しています。いま処理中のファイルが終わると止まります）")
+
+    def wait(self, msecs: int = 60000) -> bool:
+        return self._worker.wait(msecs) if self._worker is not None else True
+
+    def _on_progress(self, done: int, total: int, name: str) -> None:
+        self.progress.setText(f"ごみ箱へ移動しています… {done + 1} / {total}: {name}")
+
+    def _finish_ui(self) -> None:
+        self._worker = None
+        self._running = False
+        self.back_button.setEnabled(True)
+        self.cancel_button.hide()
+        self.progress.hide()
+
+    def _on_done(self, results: list) -> None:
+        self._finish_ui()
         self.state.refresh()
         self.finished.emit(results)
+
+    def _on_failed(self, message: str) -> None:
+        # 予期しない例外でも「実行中」のまま固まらない。移動済みの分は 1 件ずつ保存済み
+        self._finish_ui()
+        self.state.refresh()
+        self.move_button.setEnabled(True)
+        QMessageBox.warning(self, "ごみ箱への移動", f"移動を続けられませんでした: {message}\n"
+                                                   "移動できたファイルの結果は保存されています。一覧を確認してください。")
+
+
+class TrashWorker(QThread):
+    """ごみ箱への移動を GUI から分離して実行する（保護・再検証は move_to_trash の中で行う）。"""
+
+    progress = Signal(int, int, str)
+    done = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, db, ids, backend, generation=None) -> None:
+        super().__init__()
+        self.db, self.ids, self.backend, self.generation = db, ids, backend, generation
+        self.cancel_event = threading.Event()
+
+    def run(self) -> None:
+        try:
+            with trash.windows_com_thread():  # Windows のごみ箱 API は、呼び出すスレッドで COM の初期化が必要
+                results = trash.move_to_trash(self.db, self.ids, self.backend,
+                                              progress=lambda n, t, name: self.progress.emit(n, t, name),
+                                              cancel=self.cancel_event, expected_generation=self.generation)
+        except Exception as e:  # noqa: BLE001  画面を「実行中」のままにしない
+            self.failed.emit(str(e) or type(e).__name__)
+            return
+        self.done.emit(results)
 
 
 class ResultPage(QWidget):
@@ -2693,7 +3065,12 @@ def open_windows_setting(target: str) -> bool:
 
 
 class CapacityPage(QWidget):
-    """何が容量を使っているか（種類別・フォルダ別・大きいファイル・システムやアプリの領域）。"""
+    """何が容量を使っているか（種類別・フォルダ別・大きいファイル・システムやアプリの領域）。ホームから開く。"""
+
+    def add_back_link(self, text: str, fn) -> None:
+        b = button(text, "link", "undo")
+        b.clicked.connect(fn)
+        self.layout().insertWidget(0, b, 0, Qt.AlignmentFlag.AlignLeft)
 
     request_locations = Signal()
 
@@ -2843,6 +3220,10 @@ class SettingsPage(QWidget):
         self.migrate_button = button("以前の版（RecSortAI）の設定・保護・判断を取り込む")
         self.migrate_button.setVisible(self.legacy.exists() and not db.get_setting("legacy_migrated"))
         dv.addWidget(self.migrate_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.reset_user = button("保護・判断の記録を初期化して整理を再開")
+        self.reset_user.setVisible(not db.protection_ok)
+        self.reset_user.clicked.connect(self._reset_user_state)
+        dv.addWidget(self.reset_user, 0, Qt.AlignmentFlag.AlignLeft)
         dv.addWidget(label(f"保存先: {db.data_dir}（設定・保護・判断は JSON、調査結果は場所ごとのファイルに保存。"
                            "データベースは使いません）", "caption", wrap=True))
         v.addWidget(data)
@@ -2888,6 +3269,19 @@ class SettingsPage(QWidget):
             self.state.db.set_json_list(key, [p for p in self.state.db.json_list(key) if p != item.text()])
             self.refresh()
 
+    def _reset_user_state(self) -> None:
+        ans = QMessageBox.question(
+            self, "保護・判断の記録", "読み込めなかった保護・判断の記録を初期化します。\n"
+            "これまでの保護・判断は使えなくなります（壊れたファイルは保存先に退避してあり、削除しません）。"
+            "必要なファイルは整理の前にもう一度保護してください。続けますか？")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self.state.db.reset_user_state()
+        self.state.db.load_problems[:] = [p for p in self.state.db.load_problems if not p.startswith("user_state.json")]
+        self.reset_user.hide()
+        self.state.refresh()
+        self.changed.emit()
+
     def _clear_cache(self) -> None:
         prune_thumb_cache(self.state.db.thumb_dir, max_bytes=0)
         self.state.loader.cache.clear()
@@ -2925,8 +3319,8 @@ class ComparePanel(QWidget):
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setFixedHeight(336)  # カードの高さ（小さい画面でもボタンまで見えるように固定）
         v.addWidget(self.scroll)
-        self.keep_others_button = button("おすすめ以外を削除候補にする", None, "flag",
-                                         "おすすめの1つを「残す」にし、ほかを削除候補にします（まだ削除しません）")
+        self.keep_others_button = button("おすすめ以外を整理予定に入れる", None, "flag",
+                                         "おすすめの1つを「残す」にし、ほかを整理予定に入れます（まだ移動しません）")
         self.keep_others_button.clicked.connect(self._mark_others)
         v.addWidget(self.keep_others_button)
         v.addStretch()
@@ -3009,7 +3403,7 @@ class ComparePanel(QWidget):
         info.setToolTip(r["path"])
         v.addWidget(info)
         row = QHBoxLayout()
-        for name, text in (("残す", "残す"), ("削除候補", "削除候補にする")):
+        for name, text in (("残す", "残す"), ("削除候補", "整理予定に入れる")):
             b = QPushButton(text)
             b.clicked.connect(partial(self._decide, name, r["id"]))
             row.addWidget(b)
@@ -3140,7 +3534,7 @@ class TargetDialog(QDialog):
         self.result.setWordWrap(True)
         v.addWidget(self.result)
         bb = QDialogButtonBox()
-        self.apply_button = bb.addButton("選んだファイルを削除候補にする", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.apply_button = bb.addButton("選んだファイルを整理予定に入れる", QDialogButtonBox.ButtonRole.AcceptRole)
         bb.addButton("閉じる", QDialogButtonBox.ButtonRole.RejectRole)
         bb.accepted.connect(self.apply)
         bb.rejected.connect(self.reject)

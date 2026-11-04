@@ -47,6 +47,22 @@ ANYWHERE_EXCLUDES = {
     ".cache", ".thumbnails", "temp", "tmp", "thumbnails",
 }
 APP_FILE_EXTS = {".exe", ".dll", ".sys", ".msi"}
+LIBRARY_EXTS = {".dll", ".sys"}
+# 個人のファイルを置くことが多いフォルダ名（実行ファイルが混ざっていてもアプリのフォルダとはみなさない）
+PERSONAL_FOLDER_NAMES = {"downloads", "ダウンロード", "desktop", "デスクトップ", "videos", "ビデオ", "recordings",
+                         "録画", "captures", "キャプチャ", "documents", "ドキュメント", "pictures", "ピクチャ",
+                         "music", "ミュージック"}
+
+
+def looks_like_app_folder(name: str, exts: list[str]) -> bool:
+    """アプリが入ったフォルダらしいか。インストーラー（.exe・.msi）があるだけでは、アプリのフォルダとしない。
+
+    ライブラリ（.dll・.sys）があり、さらに実行ファイル（.exe）があるか、ライブラリが2つ以上あるときだけ。
+    """
+    if name.lower() in PERSONAL_FOLDER_NAMES:
+        return False
+    libs = sum(1 for e in exts if e in LIBRARY_EXTS)
+    return libs >= 1 and (".exe" in exts or libs >= 2)
 SMALL_IMAGE_BYTES = 10 * 1024  # ドライブ全体の調査で、これ未満の画像はアプリの部品として除外する
 
 # 開発用のプロジェクトフォルダの目印（ソースコードの .ts などを録画と取り違えないため、丸ごと除外する）
@@ -454,7 +470,7 @@ def scan_location(db: Store, loc: Location, skip_roots: list[str], gen: int, ctl
             errors += 1
             skip(current, e.strerror or type(e).__name__, "error")
             continue
-        subdirs, found, plain, app_folder = [], [], [], False
+        subdirs, found, plain, app_exts = [], [], [], []
         at_drive_root = drive_mode and norm(current) == norm(loc.path)
         if norm(current) != norm(loc.path) and is_project_folder({e.name for e in entries}):
             skip(current, "開発用のプロジェクトフォルダ（ソースコードなど）", "excluded")
@@ -477,7 +493,7 @@ def scan_location(db: Store, loc: Location, skip_roots: list[str], gen: int, ctl
                     continue
                 ext = os.path.splitext(entry.name)[1].lower()
                 if drive_mode and ext in APP_FILE_EXTS:
-                    app_folder = True
+                    app_exts.append(ext)
                 st = entry.stat(follow_symlinks=False)
                 category = categorize(entry.name)
                 kind = KIND_OF_CATEGORY.get(category)
@@ -493,6 +509,7 @@ def scan_location(db: Store, loc: Location, skip_roots: list[str], gen: int, ctl
                 errors += 1
                 skip(entry.path, e.strerror or type(e).__name__, "error")
         fk = folder_key(current)
+        app_folder = bool(app_exts) and looks_like_app_folder(os.path.basename(current), app_exts)
         if app_folder and norm(current) != norm(loc.path):
             # アプリのフォルダ: フォルダ全体（直下のファイルを含む）の容量を一度だけ測り、一覧には入れない
             skip(current, "アプリのフォルダ（実行ファイルを含む）", "excluded")
@@ -540,6 +557,10 @@ def task_autoscan(data, tools: media.FFmpegTools, ctl: Controller, report) -> di
     own = not isinstance(data, Store)
     db = Store(data) if own else data
     summary = {"cancelled": False, "statuses": {}}
+    if db.organize_active:  # 整理（ごみ箱への移動）中は調査を始めない
+        summary.update(cancelled=True, error="ごみ箱へ移動している間は調査できません。終わってからもう一度調べてください")
+        return summary
+    db.scan_active = True
     try:
         locations, not_scanned = build_locations(db)
         db.set_json_list("not_scanned_drives", [f"{d['root']}（{DRIVE_KIND_LABEL[d['kind']]}）"
@@ -556,15 +577,22 @@ def task_autoscan(data, tools: media.FFmpegTools, ctl: Controller, report) -> di
             summary["statuses"][loc.label] = status
             if status == "中断":
                 summary["cancelled"] = True
+                db.set_setting("analysis_state", "cancelled")
                 return summary
-        db.set_setting("scan_finished", str(time.time()))
+        db.set_setting("files_scanned", str(time.time()))
+        # 解析（ハッシュ・類似の確認）が終わるまでは「調査完了」としない。途中で落ちても running が残り、中断と分かる
+        db.set_setting("analysis_state", "running")
         purge_non_media(db)
         if not candidates.run_analysis(db, tools, ctl, report):
             summary["cancelled"] = True
+            db.set_setting("analysis_state", "cancelled")
             return summary
+        db.set_setting("analysis_state", "done")
+        db.set_setting("scan_finished", str(time.time()))
         summary["scan_files"] = totals["files"]
         return summary
     finally:
+        db.scan_active = False
         if own:
             db.close()
         else:

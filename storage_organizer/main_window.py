@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -304,8 +304,7 @@ class TitledPage(QWidget):
         self.inner = inner
 
 
-NAV_ITEMS = [("home", "ホーム"), ("target", "整理候補"), ("drive", "容量の内訳"), ("files", "ファイル一覧"),
-             ("image", "画像の整理（補助）"), ("settings", "設定")]
+NAV_ITEMS = [("home", "ホーム"), ("target", "整理する"), ("files", "ファイルを見る"), ("settings", "設定")]
 RECOMMEND_KEYS = ["重複", "類似画像", "録画確認候補", "大容量", "削除候補"]
 
 
@@ -331,8 +330,14 @@ class MainWindow(QMainWindow):
         settings_scroll.setWidget(self.settings)
         self.settings_page = TitledPage("設定", f"RecSort バージョン {__version__}。データの保存先: {self.store.data_dir}",
                                         settings_scroll)
-        self.sections = [self.home, self.flow, self.capacity, self.files, self.recommend, self.settings_page]
+        # メニューに出す 4 つの画面と、そこから開く補助の画面（容量の内訳 → ホーム、画像の整理 → ファイルを見る）
+        self.nav_pages = [self.home, self.flow, self.files, self.settings_page]
+        self.sub_pages = {self.capacity: self.home, self.recommend: self.files}
+        self.sections = self.nav_pages + list(self.sub_pages)
         self.page_widgets = self.sections
+        self.files.add_header_link("画像の整理（補助）", lambda: self.show_section(self.recommend))
+        self.recommend.add_header_link("ファイルを見るへ戻る", lambda: self.show_section(self.files))
+        self.capacity.add_back_link("ホームへ戻る", lambda: self.show_section(self.home))
 
         central = QWidget()
         central.setObjectName("Page")
@@ -405,14 +410,25 @@ class MainWindow(QMainWindow):
 
     # --- 画面の切り替え -------------------------------------------------------
     def _on_nav(self, row: int) -> None:
-        if 0 <= row < len(self.sections):
-            self.stack.setCurrentWidget(self.sections[row])
-            for page in (self.files, self.recommend, self.flow):
-                if self.sections[row] is not page:
-                    page.stop_media()
+        if 0 <= row < len(self.nav_pages):
+            self._show(self.nav_pages[row])
+
+    def _show(self, widget) -> None:
+        self.stack.setCurrentWidget(widget)
+        for page in (self.files, self.recommend, self.flow):
+            if widget is not page:
+                page.stop_media()
 
     def show_section(self, widget) -> None:
-        self.nav.setCurrentRow(self.sections.index(widget))
+        if widget in self.nav_pages:
+            self.nav.setCurrentRow(self.nav_pages.index(widget))
+            self._show(widget)
+            return
+        parent = self.sub_pages[widget]  # 補助の画面: メニューは元の項目を選択中のままにする
+        self.nav.blockSignals(True)
+        self.nav.setCurrentRow(self.nav_pages.index(parent))
+        self.nav.blockSignals(False)
+        self._show(widget)
 
     def show_page(self, widget) -> None:
         if widget in self.sections:
@@ -470,6 +486,11 @@ class MainWindow(QMainWindow):
             item.setText("" if compact else item.data(Qt.ItemDataRole.UserRole))
 
     def closeEvent(self, event) -> None:
+        final = self.flow.final
+        if final.is_running():  # ごみ箱へ移動中: ファイル単位で止め、処理中のファイルが終わるまで待つ
+            final.cancel()
+            final.wait(120000)
+            QCoreApplication.processEvents()
         for page in (self.files, self.recommend, self.flow):
             page.stop_media()
         self.flow.compare.stop()

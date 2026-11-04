@@ -10,12 +10,15 @@ if not exist .venv-build (
 call .venv-build\Scripts\activate.bat || goto :error
 python -m pip install --upgrade pip || goto :error
 python -m pip install -r requirements.txt -r requirements-dev.txt || goto :error
-python -m unittest discover -s tests || echo テストに失敗しました。内容を確認してください。
+python -m unittest discover -s tests || goto :testfail
 pyinstaller --noconfirm --clean packaging\recsort.spec || goto :error
 echo.
 echo 完成: dist\RecSort\RecSort.exe
 echo 配布するときは dist\RecSort フォルダを ZIP にまとめてください。
 exit /b 0
+:testfail
+echo テストに失敗したため、配布版は作りません。
+exit /b 1
 :error
 echo 配布版の作成に失敗しました。
 exit /b 1

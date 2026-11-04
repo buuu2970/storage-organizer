@@ -417,11 +417,12 @@ def compress(tools: FFmpegTools, source: str, output: str, preset: str, duration
 COMPARE_POINTS = (0.2, 0.4, 0.6, 0.8)
 
 
-def compare_frames(tools: FFmpegTools, path: str, duration: float, out_prefix: str, cancel=None) -> list[str]:
-    """比較画面用に、同じ相対時点（長さの 20・40・60・80%）の場面を書き出す（アプリのキャッシュへ）。"""
+def compare_frames(tools: FFmpegTools, path: str, duration: float, out_prefix: str, cancel=None,
+                   fractions=COMPARE_POINTS) -> list[str]:
+    """比較画面用に、同じ相対時点の場面を書き出す（アプリのキャッシュへ）。"""
     paths = []
-    for i, r in enumerate(COMPARE_POINTS):
-        out = f"{out_prefix}_{i}.jpg"
+    for r in fractions:
+        out = f"{out_prefix}_{int(round(r * 1000))}.jpg"
         if not os.path.exists(out):
             cp = _run([tools.ffmpeg, "-v", "error", "-y", "-ss", f"{duration * r:.3f}", "-i", path, "-frames:v", "1",
                        "-vf", "scale=320:-2", "-q:v", "4", out], cancel, timeout=60)
