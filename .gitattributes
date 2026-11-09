@@ -1,1 +1,3 @@
-*.bat text eol=crlf
+# 起動ファイルは、変換せずにそのまま保存する（Shift-JIS・CRLF）。
+# GitHub の Download ZIP でも、日本語の Windows がダブルクリックでそのまま読めるようにするため
+*.bat -text

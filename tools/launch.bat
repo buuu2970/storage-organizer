@@ -1,10 +1,10 @@
 @echo off
-rem RecSort ã‚’èµ·å‹•ã™ã‚‹ï¼ˆRecSortã‚’é–‹ã.batãƒ»ãƒ‡ãƒ¢ã‚’é–‹ã.bat ã‹ã‚‰å‘¼ã°ã‚Œã‚‹ï¼‰ã€‚
-rem 1. Python ã‚’æŽ¢ã™ï¼ˆãªã‘ã‚Œã°ã€èžã„ã¦ã‹ã‚‰è‡ªå‹•ã§å…¥ã‚Œã‚‹ï¼‰
-rem 2. åˆå›žã ã‘ã€ã“ã®ãƒ•ã‚©ãƒ«ãƒ€ã® .venv ã«å¿…è¦ãªéƒ¨å“ï¼ˆrequirements-web.txtï¼‰ã‚’å…¥ã‚Œã‚‹
-rem 3. ãƒ‡ãƒ¢ã®ã¨ãã¯ FFmpeg ã‚’ç¢ºã‹ã‚ã‚‹ï¼ˆãªã‘ã‚Œã°ã€èžã„ã¦ã‹ã‚‰é…å¸ƒå…ƒã‹ã‚‰å…¥ã‚Œã‚‹ï¼‰
-rem 4. main.py ã‚’èµ·å‹•ã™ã‚‹ï¼ˆãƒ–ãƒ©ã‚¦ã‚¶ã«ç”»é¢ãŒé–‹ãï¼‰
-chcp 65001 >nul
+rem This file is saved in Shift-JIS (CP932) so that Japanese Windows reads it correctly.
+rem RecSort ‚ð‹N“®‚·‚éiRecSort‚ðŠJ‚­.batEƒfƒ‚‚ðŠJ‚­.bat ‚©‚çŒÄ‚Î‚ê‚éjB
+rem 1. Python ‚ð’T‚·i‚È‚¯‚ê‚ÎA•·‚¢‚Ä‚©‚çŽ©“®‚Å“ü‚ê‚éj
+rem 2. ‰‰ñ‚¾‚¯A‚±‚ÌƒtƒHƒ‹ƒ_‚Ì .venv ‚É•K—v‚È•”•iirequirements-web.txtj‚ð“ü‚ê‚é
+rem 3. ƒfƒ‚‚Ì‚Æ‚«‚Í FFmpeg ‚ðŠm‚©‚ß‚éi‚È‚¯‚ê‚ÎA•·‚¢‚Ä‚©‚ç”z•zŒ³‚©‚ç“ü‚ê‚éj
+rem 4. main.py ‚ð‹N“®‚·‚éiƒuƒ‰ƒEƒU‚É‰æ–Ê‚ªŠJ‚­j
 setlocal
 cd /d "%~dp0.."
 title RecSort
@@ -12,9 +12,9 @@ title RecSort
 call :findpython
 if not defined PY (
     echo.
-    echo Pythonï¼ˆ3.12 ä»¥ä¸Šï¼‰ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚RecSort ã‚’å‹•ã‹ã™ã®ã«å¿…è¦ã§ã™ã€‚
+    echo Pythoni3.12 ˆÈãj‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñBRecSort ‚ð“®‚©‚·‚Ì‚É•K—v‚Å‚·B
     where winget >nul 2>nul && (
-        choice /C YN /M "ã„ã¾è‡ªå‹•ã§ Python ã‚’å…¥ã‚Œã¾ã™ã‹ï¼ˆæ•°åˆ†ã‹ã‹ã‚Šã¾ã™ï¼‰"
+        choice /C YN /M "‚¢‚ÜŽ©“®‚Å Python ‚ð“ü‚ê‚Ü‚·‚©i”•ª‚©‚©‚è‚Ü‚·j"
         if not errorlevel 2 (
             winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
             call :findpython
@@ -24,7 +24,7 @@ if not defined PY (
 if not defined PY goto nopython
 
 if not exist ".venv\Scripts\python.exe" (
-    echo ã¯ã˜ã‚ã¦ã®èµ·å‹•ã§ã™ã€‚å¿…è¦ãªéƒ¨å“ã‚’æº–å‚™ã—ã¦ã„ã¾ã™ï¼ˆæ•°åˆ†ã‹ã‹ã‚Šã¾ã™ï¼‰...
+    echo ‚Í‚¶‚ß‚Ä‚Ì‹N“®‚Å‚·B•K—v‚È•”•i‚ð€”õ‚µ‚Ä‚¢‚Ü‚·i”•ª‚©‚©‚è‚Ü‚·j...
     %PY% -m venv .venv || goto fail
 )
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -q -r requirements-web.txt || goto fail
@@ -32,15 +32,15 @@ if not exist ".venv\Scripts\python.exe" (
 echo %* | find "--demo" >nul && (
     ".venv\Scripts\python.exe" -c "import sys; from storage_organizer import media; sys.exit(0 if media.find_ffmpeg().available else 1)" || (
         echo.
-        echo ãƒ‡ãƒ¢ã®éŒ²ç”»ã‚’ä½œã‚‹ã«ã¯ FFmpegï¼ˆå‹•ç”»ã‚’æ‰±ã†ç„¡æ–™ã®ã‚½ãƒ•ãƒˆï¼‰ãŒå¿…è¦ã§ã™ã€‚
-        choice /C YN /M "ã„ã¾é…å¸ƒå…ƒã‹ã‚‰ FFmpeg ã‚’å…¥ã‚Œã¾ã™ã‹ï¼ˆç´„ 110MBï¼‰"
+        echo ƒfƒ‚‚Ì˜^‰æ‚ðì‚é‚É‚Í FFmpegi“®‰æ‚ðˆµ‚¤–³—¿‚Ìƒ\ƒtƒgj‚ª•K—v‚Å‚·B
+        choice /C YN /M "‚¢‚Ü”z•zŒ³‚©‚ç FFmpeg ‚ð“ü‚ê‚Ü‚·‚©i–ñ 110MBj"
         if not errorlevel 2 ".venv\Scripts\python.exe" tools\get_ffmpeg.py
     )
 )
 
 echo.
-echo RecSort ã‚’èµ·å‹•ã—ã¾ã™ã€‚ãƒ–ãƒ©ã‚¦ã‚¶ã«ç”»é¢ãŒé–‹ãã¾ã™ã€‚
-echo çµ‚ã‚ã‚‹ã¨ãã¯ã€ã“ã®é»’ã„ã‚¦ã‚£ãƒ³ãƒ‰ã‚¦ã‚’é–‰ã˜ã¦ãã ã•ã„ã€‚
+echo RecSort ‚ð‹N“®‚µ‚Ü‚·Bƒuƒ‰ƒEƒU‚É‰æ–Ê‚ªŠJ‚«‚Ü‚·B
+echo I‚í‚é‚Æ‚«‚ÍA‚±‚Ì•‚¢ƒEƒBƒ“ƒhƒE‚ð•Â‚¶‚Ä‚­‚¾‚³‚¢B
 echo.
 ".venv\Scripts\python.exe" main.py %*
 if errorlevel 1 pause
@@ -51,19 +51,19 @@ set "PY="
 set "CHECK=import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)"
 py -3 -c "%CHECK%" >nul 2>nul && (set "PY=py -3" & exit /b 0)
 python -c "%CHECK%" >nul 2>nul && (set "PY=python" & exit /b 0)
-rem è‡ªå‹•ã§å…¥ã‚ŒãŸç›´å¾Œã¯ PATH ãŒæ›´æ–°ã•ã‚Œã¦ã„ãªã„ãŸã‚ã€å…¥ã‚ŒãŸå ´æ‰€ã‚’ç›´æŽ¥è¦‹ã‚‹
+rem Ž©“®‚Å“ü‚ê‚½’¼Œã‚Í PATH ‚ªXV‚³‚ê‚Ä‚¢‚È‚¢‚½‚ßA“ü‚ê‚½êŠ‚ð’¼ÚŒ©‚é
 if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set PY="%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
 exit /b 0
 
 :nopython
 echo.
-echo Python ã‚’å…¥ã‚Œã‚‰ã‚Œã¾ã›ã‚“ã§ã—ãŸã€‚ã“ã‚Œã‹ã‚‰é–‹ããƒšãƒ¼ã‚¸ã‹ã‚‰ Python ã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¦ãã ã•ã„ã€‚
-echo ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ç”»é¢ã®æœ€åˆã§ã€ŒAdd python.exe to PATHã€ã«ãƒã‚§ãƒƒã‚¯ã‚’å…¥ã‚Œã¦ã‹ã‚‰ã€ã‚‚ã†ä¸€åº¦ãƒ€ãƒ–ãƒ«ã‚¯ãƒªãƒƒã‚¯ã—ã¦ãã ã•ã„ã€‚
+echo Python ‚ð“ü‚ê‚ç‚ê‚Ü‚¹‚ñ‚Å‚µ‚½B‚±‚ê‚©‚çŠJ‚­ƒy[ƒW‚©‚ç Python ‚ðƒCƒ“ƒXƒg[ƒ‹‚µ‚Ä‚­‚¾‚³‚¢B
+echo ƒCƒ“ƒXƒg[ƒ‹‰æ–Ê‚ÌÅ‰‚ÅuAdd python.exe to PATHv‚Éƒ`ƒFƒbƒN‚ð“ü‚ê‚Ä‚©‚çA‚à‚¤ˆê“xƒ_ƒuƒ‹ƒNƒŠƒbƒN‚µ‚Ä‚­‚¾‚³‚¢B
 start "" https://www.python.org/downloads/
 pause
 exit /b 1
 
 :fail
-echo æº–å‚™ã«å¤±æ•—ã—ã¾ã—ãŸã€‚ã‚¤ãƒ³ã‚¿ãƒ¼ãƒãƒƒãƒˆã«ã¤ãªãŒã£ã¦ã„ã‚‹ã‹ç¢ºèªã—ã¦ã€ã‚‚ã†ä¸€åº¦ãƒ€ãƒ–ãƒ«ã‚¯ãƒªãƒƒã‚¯ã—ã¦ãã ã•ã„ã€‚
+echo €”õ‚ÉŽ¸”s‚µ‚Ü‚µ‚½BƒCƒ“ƒ^[ƒlƒbƒg‚É‚Â‚È‚ª‚Á‚Ä‚¢‚é‚©Šm”F‚µ‚ÄA‚à‚¤ˆê“xƒ_ƒuƒ‹ƒNƒŠƒbƒN‚µ‚Ä‚­‚¾‚³‚¢B
 pause
 exit /b 1
