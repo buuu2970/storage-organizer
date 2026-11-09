@@ -14,7 +14,6 @@
 - この手順はまだ実行していない（PyInstaller は動かす OS 向けの exe しか作れない）。Windows 実機での作成と確認が必要
 - 配布版の exe も、起動するとブラウザ版のサーバーが動いてブラウザが開く（`main.py` と同じ）。exe 化はまだ試していない
 - **注意**: `build_windows.bat` が使う `packaging\recsort.spec` はリポジトリにない（.gitignore の `*.spec` で除外されている）。exe を作る前に用意する必要がある
-- Web 版（`web/`）の調査ツールは別の手順で作る（`web/build.ps1`。`web/README.md` を参照）
 
 ## Python が入っていない PC での確認項目
 1. ZIP を展開し、`RecSort.exe` をダブルクリックして起動する（SmartScreen の警告が出たら「詳細情報」→「実行」）
