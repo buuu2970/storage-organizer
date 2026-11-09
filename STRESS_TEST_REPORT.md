@@ -1,5 +1,8 @@
 # STRESS_TEST_REPORT（RecSort 反復試験・性能試験）
 
+> **統合前の記録です。** 統合前の shuhei 版（7ac00eb のころ）を Linux で試した結果で、統合版（`統合後` ブランチ）ではまだ実施していません。
+> 統合版のテスト結果は `INTEGRATION_NOTES.md` を参照してください。`tools/stress/` は Linux 向けで、統合版で使うには見直しが必要です。
+
 対象ソース: 識別子 **e83914cca50fb084**（`tools/stress/source_id.sh` で計算。storage_organizer/*.py の SHA-256 から求める）
 環境: Linux（Python 3.12 / PySide6 6.12 / FFmpeg 6.1）、GUI は画面なしモード（offscreen）。**Windows 実機の確認ではない**
 ログ: `stress_logs/final/`（このソースでの最終確認）、`stress_logs/final_before_common_fix/`（改善前のソースでの結果。集計に混ぜない）

@@ -1,4 +1,4 @@
-# RecSort 配布手順（リリース候補 0.9.0rc3）
+# RecSort 配布手順（1.0.0 統合版）
 
 ## 対応環境
 - Windows 10 / 11（64ビット）。主な対象は Windows 11
@@ -10,22 +10,24 @@
 2. ソース一式のフォルダで `packaging\build_windows.bat` を実行する
 3. `dist\RecSort\RecSort.exe` ができる。`dist\RecSort` フォルダごと ZIP にして配布する
 
-- 配布物に含まれないもの: 開発用の DB、サムネイルのキャッシュ、ログ、テスト、個人のパス（データはすべて実行時に `%LOCALAPPDATA%\RecSort` へ作られる）
-- この手順は Linux の開発環境では実行していない（PyInstaller は動かす OS 向けの exe しか作れない）。Windows 実機での作成と確認が必要
+- 配布物に含まれないもの: サムネイルのキャッシュ、ログ、テスト、個人のパス（データはすべて実行時に `%LOCALAPPDATA%\RecSortV1` へ作られる）
+- この手順はまだ実行していない（PyInstaller は動かす OS 向けの exe しか作れない）。Windows 実機での作成と確認が必要
+- **注意**: `build_windows.bat` が使う `packaging\recsort.spec` はリポジトリにない（.gitignore の `*.spec` で除外されている）。exe を作る前に用意する必要がある
+- Web 版（`web/`）の調査ツールは別の手順で作る（`web/build.ps1`。`web/README.md` を参照）
 
 ## Python が入っていない PC での確認項目
 1. ZIP を展開し、`RecSort.exe` をダブルクリックして起動する（SmartScreen の警告が出たら「詳細情報」→「実行」）
-2. ホームが表示され、「調べる場所を選ぶ」から調査できる
+2. ホームが表示され、自動で調査が始まる。「PCをもう一度調べる」から調べる範囲を確認して調べ直せる
 3. FFmpeg がない状態で、ホームに「FFmpeg が見つかりません」の案内と「設定を開く」が出る
 4. 設定で ffmpeg の `bin` フォルダを指定すると案内が消える
 5. 録画を選ぶとプレビューが再生される（Qt Multimedia が同梱されていること）
 6. 整理候補 → 最終確認 → ごみ箱への移動が、テスト用のファイルでできる
 7. アプリを閉じて起動し直しても、保護と判断が残っている
 8. `_internal\licenses` にライセンス全文（Qt・FFmpeg・numpy・Pillow・Python・PyInstaller）が入っている
-10. `%LOCALAPPDATA%\RecSort` に `settings.json`・`inventory`・`thumbs`・`logs` などが作られ（データベースファイルは作られない）、exe のフォルダには何も書き込まれない
+9. `%LOCALAPPDATA%\RecSortV1` に `settings.json`・`inventory`・`thumbs`・`logs` などが作られ（データベースファイルは作られない）、exe のフォルダには何も書き込まれない
 
 ## データの保存場所（データベースは使わない）
-すべて `%LOCALAPPDATA%\RecSort` に作られ、exe のフォルダには書き込みません。内容と形式は README の「データの保存」を参照。
+すべて `%LOCALAPPDATA%\RecSortV1` に作られ、exe のフォルダには書き込みません。内容と形式は README の「データの保存」を参照。
 
 | 種類 | 場所 |
 |---|---|
@@ -35,11 +37,11 @@
 | サムネイル・比較用の場面（上限 300MB） | thumbs\ |
 | エラーログ（1MB で作り直し、ホームフォルダのパスは伏せる、録画の内容は記録しない） | logs\recsort-error.log |
 
-以前の版のデータ（`%LOCALAPPDATA%\RecSortAI`）は削除せず、設定画面から取り込めます。
+以前の版のデータ（`%LOCALAPPDATA%\RecSortAI`・`%LOCALAPPDATA%\RecSort`）は読み書きしません（削除もしません）。統合版では取り込み機能を外したため、以前の版の保護・判断は引き継がれません。
 
 ## 問題の報告方法
-- 画面のスクリーンショットと、`%LOCALAPPDATA%\RecSort\logs\recsort-error.log`（ある場合）をチームに送ってください
+- 画面のスクリーンショットと、`%LOCALAPPDATA%\RecSortV1\logs\recsort-error.log`（ある場合）をチームに送ってください
 - 録画ファイルそのものは送らないでください
 
 ## 既知の制限
-README の「既知の制限」を参照してください。
+`INTEGRATION_NOTES.md` の「未検証・既知の制限」を参照してください。
