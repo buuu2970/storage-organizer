@@ -532,7 +532,8 @@ def main(argv: list[str] | None = None) -> int:
         db = Store(data_dir)
         if is_demo:
             if not demo.exists():
-                print("デモの録画を作ります（FFmpeg の合成映像だけを使います）…")
+                print("デモの録画を作ります（素材: ダウンロードの RecSort素材 の動画）…" if demo.has_sources()
+                      else "デモの録画を作ります（素材がないため、FFmpeg の合成映像だけを使います）…")
                 try:
                     demo.make(media.find_ffmpeg(db.get_setting("ffmpeg_dir")))
                 except Exception as e:  # noqa: BLE001

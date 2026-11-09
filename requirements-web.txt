@@ -1,0 +1,4 @@
+# ブラウザ版（python main.py）に必要な部品。デスクトップ版（--desktop）は requirements.txt（PySide6 を含む）
+numpy>=1.26
+Pillow>=10.0
+pywin32>=306; sys_platform == "win32"
