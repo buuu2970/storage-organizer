@@ -1193,12 +1193,20 @@ class FileNameTest(unittest.TestCase):
 
 
 class StartupTest(unittest.TestCase):
-    """main.py で実際に起動し、落ちずに動き続けること（起動処理はほかのテストでは通らないため）。"""
+    """main.py で実際に起動し、落ちずに動き続けること（起動処理はほかのテストでは通らないため）。
+
+    既定（引数なし）はブラウザ版。デスクトップ版は --desktop。ブラウザ版はテスト中にブラウザを開かず、調査も始めない。
+    """
 
     def test_main_starts_without_error(self):
+        for args in (["--desktop"], ["--no-browser", "--no-scan"]):
+            with self.subTest(args=args):
+                self._start(args)
+
+    def _start(self, args):
         with tempfile.TemporaryDirectory() as tmp:
             env = dict(os.environ, QT_QPA_PLATFORM="offscreen", RECSORT_DATA_DIR=tmp, QT_AUDIO_BACKEND="alsa")
-            proc = subprocess.Popen([sys.executable, str(ROOT / "main.py")], cwd=ROOT, env=env,
+            proc = subprocess.Popen([sys.executable, str(ROOT / "main.py"), *args], cwd=ROOT, env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 proc.wait(timeout=6)
