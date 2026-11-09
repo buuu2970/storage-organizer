@@ -97,6 +97,16 @@ class WebAppTest(unittest.TestCase):
         status, _ = self.json("/api/state", headers={"Host": "evil.example:80"})
         self.assertEqual(status, 403)
 
+    def test_second_launch_opens_running_instance(self):
+        url = f"{self.base}/"
+        (self.dir / "data" / webapp.SERVER_FILE).write_text(json.dumps({"url": url}), encoding="utf-8")
+        self.assertEqual(webapp.open_running(self.dir / "data", open_browser=False), url)
+        # 動いていないサーバー・ほかのアドレスは開かない
+        (self.dir / "data" / webapp.SERVER_FILE).write_text(json.dumps({"url": "http://127.0.0.1:1/"}), encoding="utf-8")
+        self.assertIsNone(webapp.open_running(self.dir / "data", open_browser=False))
+        (self.dir / "data" / webapp.SERVER_FILE).write_text(json.dumps({"url": "http://example.com/"}), encoding="utf-8")
+        self.assertIsNone(webapp.open_running(self.dir / "data", open_browser=False))
+
     def test_port_cannot_be_shared(self):
         # 同じ番号でもう1つ待ち受けられない（ほかのプログラムに RecSort あての要求を横取りさせない）
         with self.assertRaises(OSError):

@@ -505,6 +505,29 @@ class LocalServer(ThreadingHTTPServer):
         super().server_bind()
 
 
+SERVER_FILE = "server.json"  # 起動中のサーバーのアドレス（2つ目を起動しようとしたときに、そちらを開くため）
+
+
+def open_running(data_dir: Path, open_browser: bool = True) -> str | None:
+    """すでに起動している RecSort（ブラウザ版）があれば、そのアドレスを返し、ブラウザで開く。"""
+    import urllib.request
+    try:
+        url = json.loads((Path(data_dir) / SERVER_FILE).read_text(encoding="utf-8"))["url"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not str(url).startswith("http://127.0.0.1:"):
+        return None
+    try:
+        with urllib.request.urlopen(url, timeout=3) as res:  # 本当に動いているか確かめる
+            if b"recsort-token" not in res.read(4096):
+                return None
+    except OSError:
+        return None
+    if open_browser:
+        webbrowser.open(url)
+    return url
+
+
 def make_server(app: App, port: int = 0) -> ThreadingHTTPServer:
     handler = type("BoundHandler", (Handler,), {"app": app})
     return LocalServer(("127.0.0.1", port), handler)
@@ -527,7 +550,12 @@ def main(argv: list[str] | None = None) -> int:
     try:  # 保存データを読み書きする前に、二重起動を防ぐロックを取る（デスクトップ版とも共通）
         lock = InstanceLock(data_dir).acquire()
     except AlreadyRunning:
+        url = open_running(data_dir, "--no-browser" not in argv)
+        if url:  # 起動中の RecSort の画面を開く（どこで開いているか分からなくならないように）
+            print(f"RecSort はすでに起動しています。その画面をブラウザで開きました: {url}")
+            return 0
         print("RecSort はすでに起動しています。保護や判断の記録が食い違わないよう、同時に2つは起動できません。")
+        print("（デスクトップ版が開いていないか確認してください）")
         return 1
     try:
         db = Store(data_dir)
@@ -556,6 +584,11 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 continue
         url = f"http://127.0.0.1:{server.server_address[1]}/"
+        server_file = Path(data_dir) / SERVER_FILE
+        try:
+            server_file.write_text(json.dumps({"url": url, "pid": os.getpid()}), encoding="utf-8")
+        except OSError:
+            pass
         print(f"RecSort {__version__} をブラウザで開きます: {url}")
         print("このウィンドウを閉じるか Ctrl+C で終了します。")
         if "--no-browser" not in argv:
@@ -574,6 +607,10 @@ def main(argv: list[str] | None = None) -> int:
                 app.scan_thread.join(15)
             db.flush_user_state()
             db.save_scan_state()
+            try:
+                server_file.unlink()
+            except OSError:
+                pass
         return 0
     finally:
         lock.release()
