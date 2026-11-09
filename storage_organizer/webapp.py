@@ -519,7 +519,8 @@ def main(argv: list[str] | None = None) -> int:
         n = demo.remove()
         print(f"デモの録画を {n} 本消しました（デモで作ったファイルだけ）。")
         return 0
-    is_demo = "--demo" in argv
+    demo_only = "--demo-only" in argv  # デモのフォルダだけを調べる（自分のファイルを映したくないとき）
+    is_demo = "--demo" in argv or demo_only
     if is_demo:  # デモは保存先を分ける（自分の判断・保護の記録と混ぜない）
         os.environ["RECSORT_DATA_DIR"] = str(demo.demo_data_dir())
     data_dir = default_data_dir()
@@ -539,9 +540,14 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception as e:  # noqa: BLE001
                     print(f"デモの録画を作れませんでした: {e}")
                     return 1
-            db.set_json_list("demo_locations", [str(p) for p in demo.demo_roots().values()])
+            # 既定は PC 全体を調べる（ふだんと同じ）。素材のフォルダは、デモの録画と重複して見えるので外す
+            db.set_json_list("demo_locations", [str(p) for p in demo.demo_roots().values()] if demo_only else [])
+            src = demo.source_dir()
+            if src is not None:
+                db.set_json_list("excluded_folders", [p for p in db.json_list("excluded_folders")
+                                                      if os.path.normcase(p) != os.path.normcase(str(src))] + [str(src)])
         app = App(db)
-        app.demo = is_demo
+        app.demo = "demo-only" if demo_only else ("all" if is_demo else False)
         server = None
         for port in (8765, 8766, 8767, 0):  # 決まった番号が使われていれば、空いている番号を使う
             try:

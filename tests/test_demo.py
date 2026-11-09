@@ -29,8 +29,15 @@ class DemoTest(unittest.TestCase):
             self.places.append((label, str(self.base / name)))
         self.patch = mock.patch.object(autoscan, "known_folders", lambda: list(self.places))
         self.patch.start()
+        # ドライブの直下の代わり（本物の C:\・D:\ には作らない）
+        for name in ("C", "D"):
+            (self.base / name).mkdir()
+        self.drives = {"Cドライブ": self.base / "C" / demo.DEMO_FOLDER, "別のドライブ": self.base / "D" / demo.DEMO_FOLDER}
+        self.patch_drives = mock.patch.object(demo, "_drive_roots", lambda: dict(self.drives))
+        self.patch_drives.start()
 
     def tearDown(self):
+        self.patch_drives.stop()
         self.patch.stop()
         self._tmp.cleanup()
 
@@ -72,9 +79,12 @@ class DemoTest(unittest.TestCase):
 
     @unittest.skipUnless(FFMPEG.available, "FFmpeg がありません")
     def test_make_creates_playable_videos_in_each_place(self):
+        (self.base / "readonly").write_text("x")  # 書き込めない場所（ファイルの下にはフォルダを作れない）
+        self.drives["別のドライブ"] = self.base / "readonly" / demo.DEMO_FOLDER
         files = demo.make(FFMPEG, report=lambda m: None)
         self.assertGreaterEqual(len(files), 10)
-        self.assertEqual({p.parent.parent.name for p in files}, {"Videos", "Desktop", "Downloads", "Documents"})
+        # ドライブの直下にも置く。書き込めない場所は飛ばして、ほかの場所には作る
+        self.assertEqual({p.parent.parent.name for p in files}, {"Videos", "Desktop", "Downloads", "Documents", "C"})
         info = media.probe(FFMPEG, str(demo.demo_roots()["ビデオ"] / "ゲーム実況_ボス戦_第1回.mp4"))
         self.assertTrue(info["has_video"])
         self.assertTrue(demo.exists())

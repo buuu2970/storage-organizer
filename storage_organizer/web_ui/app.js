@@ -150,7 +150,8 @@ async function refreshState() {
 // --- ホーム ------------------------------------------------------------------------
 function banners() {
   let html = '';
-  if (state && state.demo) html += '<div class="note">デモモード: ビデオ・デスクトップ・ダウンロード・ドキュメントの「RecSortデモ」フォルダだけを調べています（自分の録画は表示しません）。</div>';
+  if (state && state.demo === 'all') html += '<div class="note">デモモード: PC 全体を調べています。デモの録画は、ビデオ・デスクトップ・ダウンロード・ドキュメント・ドライブの直下などの「RecSortデモ」フォルダに置いてあります。</div>';
+  if (state && state.demo === 'demo-only') html += '<div class="note">デモモード: 「RecSortデモ」フォルダだけを調べています（自分の録画は表示しません）。</div>';
   if (state && !state.protection_ok) html += '<div class="note danger"><b>保護の記録を読み込めませんでした。</b> 安全のため、ごみ箱への移動を止めています。設定で記録を確認してください。</div>';
   if (state && !state.ffmpeg) html += '<div class="note warn">FFmpeg が見つかりません。録画の長さ・黒画面・無音・似た録画の判定とプレビュー画像は使えません（完全に同じ録画の検出とごみ箱への移動は使えます）。 <button class="btn small" data-go="settings">設定を開く</button></div>';
   return html;

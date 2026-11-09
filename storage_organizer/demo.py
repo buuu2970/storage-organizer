@@ -5,7 +5,8 @@
 - 元にする動画: ダウンロードの「RecSort素材」に、学校生活の動画（ChatGPT などで作ったもの。ファイル名は SOURCES）が
   あればそれを使う。なければ FFmpeg の合成映像だけで作る。重複のコピー・低画質版・再圧縮版・短い録画・無音・暗い録画・
   壊れた録画は、どちらの場合もこのプログラムが作る（意図どおりの「整理候補」を確実に見せるため）
-- デモのときは保存先を分け（RecSortDemo）、デモのフォルダだけを調べる。自分の録画やファイル名を画面に映さないため
+- デモのときは保存先を分ける（RecSortDemo。ふだんの判断・保護の記録と混ぜない）。調べる範囲はふだんと同じ PC 全体
+  （素材のフォルダだけは外す）。--demo-only ではデモのフォルダだけを調べる（自分の録画やファイル名を映したくないとき）
 - 片付け（--remove-demo）では、デモで作ったファイルだけを消す（作ったファイルの一覧を目印のファイルに記録しておく）
 """
 
@@ -46,6 +47,8 @@ DERIVED = [
     ("ダウンロード", "ゲーム実況_ボス戦_第1回_低画質.mp4", "ゲーム実況_ボス戦_第1回.mp4", "lowres", 2, "似た録画（解像度違い）"),
     ("ドキュメント", "授業の録画_再圧縮.mp4", "授業の録画.mp4", "recompress", 4, "似た録画（再圧縮）"),
     ("ダウンロード", "壊れた録画.mp4", None, "broken", 7, "読み込めない録画"),
+    ("Cドライブ", "ゲーム実況_ボス戦_第1回 (2).mp4", "ゲーム実況_ボス戦_第1回.mp4", "copy", 6, "完全に同じ録画（ドライブの直下）"),
+    ("別のドライブ", "カメラ撮影 (バックアップ).mp4", "カメラ撮影.mp4", "copy", 8, "完全に同じ録画（別のドライブ）"),
 ]
 
 
@@ -73,6 +76,9 @@ SOURCE_DERIVED = [
     ("ダウンロード", "数学の授業_第3回_低画質.mp4", "math_class.mp4", "lowres", 2, "似た録画（解像度違い）"),
     ("ドキュメント", "オンライン授業_再圧縮.mp4", "online_lecture.mp4", "recompress", 4, "似た録画（再圧縮）"),
     ("ダウンロード", "壊れた録画.mp4", None, "broken", 7, "読み込めない録画"),
+    ("Cドライブ", "数学の授業_第3回 (2).mp4", "math_class.mp4", "copy", 6, "完全に同じ録画（ドライブの直下）"),
+    ("別のドライブ", "サッカー部_パス練習 (バックアップ).mp4", "soccer_practice.mp4", "copy", 8,
+     "完全に同じ録画（別のドライブ）"),
 ]
 REQUIRED_SOURCE = "math_class.mp4"  # これがあれば素材を使う（重複・似た録画の元になる）
 QUIET_AMBIENCE = "anoisesrc=c=pink:a=0.03"  # 素材に音がないときに足す、小さな環境音（無音と判定されない大きさ）
@@ -88,11 +94,30 @@ def has_sources() -> bool:
     return d is not None and (d / REQUIRED_SOURCE).is_file()
 
 
+def _drive_roots() -> dict[str, Path]:
+    """Windows のドライブの直下（Cドライブ）と、別の内蔵ドライブ（あれば）のデモのフォルダ。
+
+    「ドライブのどこにあっても見つかる」ことを見せるため。書き込めない場合（学校の PC など）は make で飛ばす。
+    """
+    system = os.path.normcase(os.environ.get("SystemDrive", "C:") + os.sep)
+    internal = [d["root"] for d in autoscan.local_drives() if d["kind"] == "internal"]
+    roots = {}
+    for root in internal:
+        if os.path.normcase(root) == system:
+            roots["Cドライブ"] = Path(root) / DEMO_FOLDER
+    others = [r for r in internal if os.path.normcase(r) != system]
+    if others:
+        roots["別のドライブ"] = Path(others[0]) / DEMO_FOLDER
+    return roots
+
+
 def demo_roots() -> dict[str, Path]:
-    """表示名 → デモのフォルダ（ビデオ・デスクトップ・ダウンロード・ドキュメントの中）。"""
+    """表示名 → デモのフォルダ（ビデオ・デスクトップ・ダウンロード・ドキュメントの中と、ドライブの直下）。"""
     places = dict(autoscan.known_folders())
-    return {label: Path(places[label]) / DEMO_FOLDER for label in ("ビデオ", "デスクトップ", "ダウンロード", "ドキュメント")
-            if label in places}
+    roots = {label: Path(places[label]) / DEMO_FOLDER for label in ("ビデオ", "デスクトップ", "ダウンロード", "ドキュメント")
+             if label in places}
+    roots.update(_drive_roots())
+    return roots
 
 
 def demo_data_dir() -> Path:
@@ -118,7 +143,13 @@ def make(tools: media.FFmpegTools, report=print) -> list[Path]:
     for root in roots.values():
         if root.exists() and not (root / MARKER).is_file():
             raise RuntimeError(f"{root} はデモで作ったフォルダではないため、使いません（名前を変えてください）")
-        root.mkdir(parents=True, exist_ok=True)
+    for label, root in list(roots.items()):
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:  # 学校の PC などで、ドライブの直下に書き込めない場合は、その場所を使わない
+            report(f"{root} に書き込めないため、ここには置きません")
+            del roots[label]
+            created.pop(label, None)
     made: dict[str, Path] = {}
     now = time.time()
 
