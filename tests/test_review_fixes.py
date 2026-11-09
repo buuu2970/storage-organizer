@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -88,6 +90,29 @@ time.sleep(60)
 """
 
 
+@contextlib.contextmanager
+def lock_test_dir():
+    """一時フォルダを作り、終わったら消す。
+
+    Windows では、ロックを持っていたプロセスを終了させた直後に instance.lock を消すと、
+    OS がまだファイルを解放しておらず WinError 32（ほかのプロセスが使用中）になることがある。
+    アプリの acquire と同じ考え方で、少し待ってから消し直す。
+    """
+    t = tempfile.mkdtemp()
+    try:
+        yield t
+    finally:
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                shutil.rmtree(t)
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
+
+
 class InstanceLockTest(unittest.TestCase):
     def start_holder(self, data):
         p = subprocess.Popen([sys.executable, "-c", LOCK_HOLDER.format(root=str(ROOT), data=str(data))],
@@ -96,7 +121,7 @@ class InstanceLockTest(unittest.TestCase):
         return p
 
     def test_second_process_cannot_lock_and_crash_releases(self):
-        with tempfile.TemporaryDirectory() as t:
+        with lock_test_dir() as t:
             p = self.start_holder(t)
             try:
                 with self.assertRaises(AlreadyRunning):
@@ -109,7 +134,7 @@ class InstanceLockTest(unittest.TestCase):
 
     @unittest.skipUnless(importlib.util.find_spec("PySide6"), "PySide6 がありません（二重起動の画面まで到達できない）")
     def test_second_app_instance_exits_without_touching_data(self):
-        with tempfile.TemporaryDirectory() as t:
+        with lock_test_dir() as t:
             user = Path(t) / "user_state.json"
             user.write_text(json.dumps({"/x/a.mp4": {"protected": 1}}), encoding="utf-8")
             before = user.read_bytes()

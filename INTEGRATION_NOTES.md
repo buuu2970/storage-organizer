@@ -58,9 +58,11 @@ Web 版とデスクトップ版の違いは README の「Web 版」を参照。
 
 - `pytest tests`: 197 passed, 16 skipped（スキップの内訳は上と同じ）
 - `python -m unittest discover -s tests`: 213 件 OK（16 skipped）
-- `test_review_fixes.py::InstanceLockTest::test_second_app_instance_exits_without_touching_data` は、
-  実行するたびに成功したり失敗したりする（6 回中 2〜3 回失敗）。後片付けで一時フォルダの instance.lock を消すときに
-  WinError 32（ほかのプロセスが使用中）になる。今回の変更より前の 2892fe4 でも同じように起きる
+- `test_review_fixes.py::InstanceLockTest::test_second_app_instance_exits_without_touching_data` が、
+  実行するたびに成功したり失敗したりしていた（6 回中 2〜3 回失敗。統合直後の 2892fe4 でも同じ）。
+  ロックを持つプロセスを終了させた直後に一時フォルダの instance.lock を消すと、Windows がまだファイルを解放しておらず
+  WinError 32（ほかのプロセスが使用中）になっていた。アプリの不具合ではない。
+  テスト側で、一時フォルダを消すときに少し待って消し直すよう修正（15 回続けて成功）
 - Web 版（`web/`）には自動テストがない
 
 ## 未検証・既知の制限
