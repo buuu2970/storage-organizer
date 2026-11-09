@@ -4,7 +4,8 @@ rem RecSort を起動する（RecSortを開く.bat・デモを開く.bat から呼ばれる）。
 rem 1. Python を探す（なければ、聞いてから自動で入れる）
 rem 2. 初回だけ、このフォルダの .venv に必要な部品（requirements-web.txt）を入れる
 rem 3. デモのときは FFmpeg を確かめる（なければ、聞いてから配布元から入れる）
-rem 4. main.py を起動する（ブラウザに画面が開く）
+rem 4. はじめての起動のときは、デスクトップにショートカット（RecSort・RecSort デモ）を作る
+rem 5. main.py を起動する（ブラウザに画面が開く）
 setlocal
 cd /d "%~dp0.."
 title RecSort
@@ -26,8 +27,11 @@ if not defined PY goto nopython
 if not exist ".venv\Scripts\python.exe" (
     echo はじめての起動です。必要な部品を準備しています（数分かかります）...
     %PY% -m venv .venv || goto fail
+    set "FIRST=1"
 )
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -q -r requirements-web.txt || goto fail
+rem はじめての起動（フォルダを移した後も含む）のときだけ、デスクトップにショートカットを作る
+if defined FIRST ".venv\Scripts\python.exe" tools\make_shortcuts.py
 
 echo %* | find "--demo" >nul && (
     ".venv\Scripts\python.exe" -c "import sys; from storage_organizer import media; sys.exit(0 if media.find_ffmpeg().available else 1)" || (
