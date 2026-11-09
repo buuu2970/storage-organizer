@@ -33,7 +33,7 @@ SCHEMA_VERSION = 1  # 保存形式の版。新しい版で保存されたデー�
 DATA_DIR_NAME = "RecSortV1"
 ANALYSIS_STATES = ("未解析", "解析中", "完了", "一部失敗", "失敗")
 DECISIONS = ("残す", "削除候補", "保留", "両方残す")
-PATH_LIST_KEYS = ("extra_locations", "excluded_folders", "disabled_locations")
+PATH_LIST_KEYS = ("extra_locations", "excluded_folders", "disabled_locations", "demo_locations")
 # 解析結果（JSON 文字列で持つ項目は loads() で読む）
 ANALYSIS_FIELDS = ("analysis_state", "analysis_error", "meta", "features", "thumbs", "sha256", "taken_at", "dhash",
                    "light_state", "light_note", "failure", "vsig")

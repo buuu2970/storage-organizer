@@ -39,8 +39,9 @@ def signature(tools: media.FFmpegTools, path: str, duration: float, cancel=None)
     for t in media._sample_times(duration, N_POINTS):
         if cancel is not None and cancel.is_set():
             raise media.Cancelled()
-        cp = media._run([tools.ffmpeg, "-v", "error", "-ss", f"{t:.3f}", "-i", path, "-frames:v", "1",
-                         "-vf", f"scale={W}:{H}", "-pix_fmt", "gray", "-f", "rawvideo", "-"], cancel, timeout=60)
+        cp = media.run_at(tools, ["-v", "error"], t, path,
+                          ["-frames:v", "1", "-vf", f"scale={W}:{H}", "-pix_fmt", "gray", "-f", "rawvideo", "-"],
+                          lambda c: c.returncode == 0 and len(c.stdout) == W * H, cancel)
         frames.append(cp.stdout if cp.returncode == 0 and len(cp.stdout) == W * H else None)
     if sum(f is not None for f in frames) < N_POINTS // 2:
         raise RuntimeError("代表場面を取り出せませんでした")

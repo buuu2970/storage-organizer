@@ -262,6 +262,14 @@ def build_locations(db: Store, include_disabled: bool = False) -> tuple[list[Loc
     locations: list[Location] = []
     seen: set[str] = set()
     disabled = set() if include_disabled else {norm(p) for p in db.json_list("disabled_locations")}
+    demo = db.json_list("demo_locations")
+    if demo:  # デモ（main.py --demo）: 決めたフォルダだけを調べる。自分の録画やファイル名を画面に映さないため
+        for path in demo:
+            path = os.path.normpath(path)
+            if norm(path) not in seen and os.path.isdir(path):
+                seen.add(norm(path))
+                locations.append(Location(path, "extra", f"デモ {path}", len(locations)))
+        return locations, []
 
     def add(path, kind, label):
         path = os.path.normpath(path)  # 表記を統一（C:/… と C:\… を同じ表記に）

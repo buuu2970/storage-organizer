@@ -41,6 +41,7 @@ class App:
         self.scan_progress: dict = {}
         self.scan_result: dict | None = None
         self.trash_job: dict | None = None
+        self.demo = False
         self._lock = threading.Lock()
         self._thumb_lock = threading.Semaphore(2)
 
@@ -87,7 +88,7 @@ class App:
             "protection_ok": self.db.protection_ok, "problems": list(self.db.load_problems),
             "trashing": bool(self.trash_job and not self.trash_job.get("done")),
             "not_scanned": self.db.json_list("not_scanned_drives"),
-            "data_dir": str(self.db.data_dir),
+            "data_dir": str(self.db.data_dir), "demo": self.demo,
         }
 
     # --- 調査 -----------------------------------------------------------------
@@ -487,17 +488,40 @@ class Handler(BaseHTTPRequestHandler):
             pass  # 再生位置を変えるとブラウザが途中で接続を切る（正常）
 
 
+class LocalServer(ThreadingHTTPServer):
+    """127.0.0.1 の番号を独り占めするサーバー。
+
+    標準の HTTPServer は SO_REUSEADDR を使う。Windows ではこれだと、ほかのプログラムが同じ番号で待ち受けられ、
+    RecSort あての要求を横取りできてしまう。そのため使わず、Windows では SO_EXCLUSIVEADDRUSE を付ける。
+    """
+
+    allow_reuse_address = False
+    daemon_threads = True
+
+    def server_bind(self):
+        import socket
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def make_server(app: App, port: int = 0) -> ThreadingHTTPServer:
     handler = type("BoundHandler", (Handler,), {"app": app})
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    server.daemon_threads = True
-    return server
+    return LocalServer(("127.0.0.1", port), handler)
 
 
 def main(argv: list[str] | None = None) -> int:
     from .instance_lock import AlreadyRunning, InstanceLock
     from .store import default_data_dir
     argv = sys.argv[1:] if argv is None else argv
+    from . import demo
+    if "--remove-demo" in argv:
+        n = demo.remove()
+        print(f"デモの録画を {n} 本消しました（デモで作ったファイルだけ）。")
+        return 0
+    is_demo = "--demo" in argv
+    if is_demo:  # デモは保存先を分ける（自分の判断・保護の記録と混ぜない）
+        os.environ["RECSORT_DATA_DIR"] = str(demo.demo_data_dir())
     data_dir = default_data_dir()
     try:  # 保存データを読み書きする前に、二重起動を防ぐロックを取る（デスクトップ版とも共通）
         lock = InstanceLock(data_dir).acquire()
@@ -506,7 +530,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         db = Store(data_dir)
+        if is_demo:
+            if not demo.exists():
+                print("デモの録画を作ります（FFmpeg の合成映像だけを使います）…")
+                try:
+                    demo.make(media.find_ffmpeg(db.get_setting("ffmpeg_dir")))
+                except Exception as e:  # noqa: BLE001
+                    print(f"デモの録画を作れませんでした: {e}")
+                    return 1
+            db.set_json_list("demo_locations", [str(p) for p in demo.demo_roots().values()])
         app = App(db)
+        app.demo = is_demo
         server = None
         for port in (8765, 8766, 8767, 0):  # 決まった番号が使われていれば、空いている番号を使う
             try:

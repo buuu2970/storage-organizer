@@ -86,8 +86,20 @@ def winget_ffmpeg_dirs(local_appdata: str | None = None) -> list[str]:
     return found
 
 
+def manual_ffmpeg_dirs(local_appdata: str | None = None) -> list[str]:
+    """配布元の zip を %LOCALAPPDATA%\\Programs\\FFmpeg に展開した場合の bin フォルダ候補（探すだけ）。"""
+    base = local_appdata if local_appdata is not None else os.environ.get("LOCALAPPDATA", "")
+    root = Path(base) / "Programs" / "FFmpeg" if base else None
+    if root is None or not root.is_dir():
+        return []
+    try:
+        return sorted({str(p.parent) for p in root.glob("*/bin/" + _exe("ffmpeg"))}, reverse=True)
+    except OSError:
+        return []
+
+
 def find_ffmpeg(custom_dir: str | None = None) -> FFmpegTools:
-    """FFmpeg を探す: 設定のフォルダ → PATH → WinGet（Links・Packages）。見つからなければ利用不可。"""
+    """FFmpeg を探す: 設定のフォルダ → PATH → WinGet（Links・Packages）→ Programs\\FFmpeg。見つからなければ利用不可。"""
     if custom_dir:
         pair = _pair_in(custom_dir)
         if pair:
@@ -100,6 +112,10 @@ def find_ffmpeg(custom_dir: str | None = None) -> FFmpegTools:
             pair = _pair_in(folder)
             if pair:
                 return FFmpegTools(*pair, "WinGet でインストールされた FFmpeg")
+        for folder in manual_ffmpeg_dirs():
+            pair = _pair_in(folder)
+            if pair:
+                return FFmpegTools(*pair, "Programs\\FFmpeg に展開した FFmpeg")
     return FFmpegTools(None, None)
 
 
@@ -188,16 +204,34 @@ def frame_count_for(duration: float, max_frames: int) -> int:
     return int(min(max_frames, max(6, duration // 10)))
 
 
+def run_at(tools: FFmpegTools, pre: list[str], t: float, path: str, post: list[str], ok, cancel=None,
+           timeout: float = 60) -> subprocess.CompletedProcess:
+    """t 秒の位置から ffmpeg を実行する。
+
+    まず位置へ飛んでから読む（速い）。テレビ録画などの .ts では、これで1コマも取り出せないことがあるため、
+    結果が ok(cp) を満たさなければ、先頭から読んで t 秒まで進める方法でやり直す（遅いが確実）。
+    """
+    cp = _run([tools.ffmpeg, *pre, "-ss", f"{t:.3f}", "-i", path, *post], cancel, timeout=timeout)
+    if ok(cp):
+        return cp
+    return _run([tools.ffmpeg, *pre, "-i", path, "-ss", f"{t:.3f}", *post], cancel, timeout=timeout)
+
+
+def _wrote(out: str):
+    return lambda cp: cp.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+
+
 def extract_frames(tools: FFmpegTools, path: str, duration: float, count: int,
                    cancel=None) -> np.ndarray:
     frames = []
+    size = FRAME_W * FRAME_H * 3
     for t in _sample_times(duration, count):
         if cancel is not None and cancel.is_set():
             raise Cancelled()
-        cp = _run([tools.ffmpeg, "-v", "error", "-ss", f"{t:.3f}", "-i", path, "-frames:v", "1",
-                   "-vf", f"scale={FRAME_W}:{FRAME_H}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
-                  cancel, timeout=60)
-        if cp.returncode == 0 and len(cp.stdout) == FRAME_W * FRAME_H * 3:
+        cp = run_at(tools, ["-v", "error"], t, path,
+                    ["-frames:v", "1", "-vf", f"scale={FRAME_W}:{FRAME_H}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+                    lambda c: c.returncode == 0 and len(c.stdout) == size, cancel)
+        if cp.returncode == 0 and len(cp.stdout) == size:
             frames.append(np.frombuffer(cp.stdout, np.uint8).reshape(FRAME_H, FRAME_W, 3))
     if not frames:
         raise RuntimeError("映像フレームを取り出せませんでした")
@@ -224,8 +258,10 @@ def measure_max_volume(tools: FFmpegTools, path: str, duration: float, count: in
     for t in _sample_times(max(duration - seg, 0.0), count if duration > seg * 2 else 1):
         if cancel is not None and cancel.is_set():
             raise Cancelled()
-        cp = _run([tools.ffmpeg, "-hide_banner", "-nostats", "-ss", f"{t:.3f}", "-t", f"{seg:.3f}", "-i", path,
-                   "-vn", "-af", "volumedetect", "-f", "null", "-"], cancel, timeout=60)
+        cp = run_at(tools, ["-hide_banner", "-nostats"], t, path,
+                    ["-t", f"{seg:.3f}", "-vn", "-af", "volumedetect", "-f", "null", "-"],
+                    lambda c: c.returncode == 0 and parse_max_volume(c.stderr.decode("utf-8", "replace")) is not None,
+                    cancel)
         v = parse_max_volume(cp.stderr.decode("utf-8", "replace")) if cp.returncode == 0 else None
         if v is not None:
             values.append(v)
@@ -239,9 +275,9 @@ def make_thumbnails(tools: FFmpegTools, path: str, duration: float, out_prefix: 
     times = [duration * r for r in (0.2, 0.5, 0.8)] if duration > 0 else [0.0]
     for i, t in enumerate(times):
         out = f"{out_prefix}_{i}.jpg"
-        cp = _run([tools.ffmpeg, "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", path,
-                   "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "5", out], cancel, timeout=60)
-        if cp.returncode == 0 and os.path.exists(out):
+        cp = run_at(tools, ["-v", "error", "-y"], t, path,
+                    ["-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "5", out], _wrote(out), cancel)
+        if _wrote(out)(cp):
             paths.append(out)
     return paths
 
@@ -308,9 +344,9 @@ def compare_frames(tools: FFmpegTools, path: str, duration: float, out_prefix: s
     for r in fractions:
         out = f"{out_prefix}_{int(round(r * 1000))}.jpg"
         if not os.path.exists(out):
-            cp = _run([tools.ffmpeg, "-v", "error", "-y", "-ss", f"{duration * r:.3f}", "-i", path, "-frames:v", "1",
-                       "-vf", "scale=320:-2", "-q:v", "4", out], cancel, timeout=60)
-            if cp.returncode != 0 or not os.path.exists(out):
+            cp = run_at(tools, ["-v", "error", "-y"], duration * r, path,
+                        ["-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4", out], _wrote(out), cancel)
+            if not _wrote(out)(cp):
                 paths.append("")
                 continue
         paths.append(out)

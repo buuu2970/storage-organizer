@@ -97,6 +97,11 @@ class WebAppTest(unittest.TestCase):
         status, _ = self.json("/api/state", headers={"Host": "evil.example:80"})
         self.assertEqual(status, 403)
 
+    def test_port_cannot_be_shared(self):
+        # 同じ番号でもう1つ待ち受けられない（ほかのプログラムに RecSort あての要求を横取りさせない）
+        with self.assertRaises(OSError):
+            webapp.make_server(webapp.App(self.db), self.server.server_address[1])
+
     def test_index_carries_token_and_static_paths_stay_inside(self):
         status, raw, headers = self.request("/", token=False)
         self.assertEqual(status, 200)
