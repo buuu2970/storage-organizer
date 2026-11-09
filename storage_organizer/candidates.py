@@ -117,7 +117,6 @@ def analyze_video_light(tools: media.FFmpegTools, path: str, cancel=None) -> dic
     taken = _parse_creation_time(cp.stdout.decode("utf-8", "replace").strip().splitlines()[0]
                                  if cp.returncode == 0 and cp.stdout.strip() else None)
     failures = []
-    features = None
     duration = info.get("duration", 0)
     if 0 < duration < SHORT_VIDEO_SEC:
         failures.append({"kind": "short", "reason": f"再生時間が {duration:.1f} 秒と極端に短い録画です"
@@ -126,9 +125,6 @@ def analyze_video_light(tools: media.FFmpegTools, path: str, cancel=None) -> dic
         try:
             frames = media.extract_frames(tools, path, duration, 3, cancel)
             feat = media.frame_features(frames)
-            # AI の予測に使う「動画の特徴」（確認した3場面の明るさ・動きなど。内容の意味は判断しない）
-            features = {k: round(float(feat[k]), 4) for k in ("brightness", "contrast", "saturation", "motion",
-                                                              "black_ratio", "static_ratio")}
             if feat["black_ratio"] >= 0.99 or (feat["frames"] >= 3 and feat["brightness"] < 0.04):
                 failures.append({"kind": "dark", "reason": "確認した3場面がほぼ真っ暗です"
                                                           "（音声だけの録画や暗い場面の可能性もあります）"})
@@ -137,10 +133,7 @@ def analyze_video_light(tools: media.FFmpegTools, path: str, cancel=None) -> dic
     silent = silence_failure(tools, path, info, cancel)
     if silent:
         failures.append(silent)
-    result = {"state": "完了", "meta": info, "taken_at": taken, "failures": failures}
-    if features:
-        result["features"] = features
-    return result
+    return {"state": "完了", "meta": info, "taken_at": taken, "failures": failures}
 
 
 def silence_failure(tools: media.FFmpegTools, path: str, info: dict, cancel=None) -> dict | None:
@@ -193,8 +186,6 @@ def light_analyze(db: Database, row, tools: media.FFmpegTools, cancel=None) -> s
         fields["taken_at"] = result["taken_at"]
     if result.get("dhash"):
         fields["dhash"] = result["dhash"]
-    if result.get("features"):
-        fields["features"] = result["features"]
     db.update_video(row["id"], **fields)
     return result["state"]
 
