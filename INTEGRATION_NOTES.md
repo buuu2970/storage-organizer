@@ -41,6 +41,28 @@
   完全削除の指示（TSF_DELETE_RECYCLE_IF_POSSIBLE なし）を模擬すると中止され、元のファイルが残ることを確認
 - 画面の起動確認: ダミーの録画フォルダで5画面を表示し、削除候補 → 最終確認 → 確認で「いいえ」なら移動しないことを確認
 
+## 統合後に入った変更（11/04〜11/09）
+
+| コミット | 内容 |
+|---|---|
+| d102cd5 | ごみ箱への移動と調査を同時に実行できないよう、内部で原子的に防ぐ（tests/test_concurrency.py を追加）。Pillow 14 で廃止予定の `getdata()` の置き換え、Windows 以外・PySide6 なしの環境でのテスト修正 |
+| e3fd0a1 | 色の整理（theme.py・organizer.py・player.py）。あわせて AI の厳選・ジャンル予測（ai_curation.py・profiles.py・samples.py）と動画の圧縮（media.py）も入ったが、どこからも呼ばれていなかった |
+| 1756996 | PR #3（beginner-ux-ai → main）。上の2件と統合後の内容が main に入った |
+| f3191ea | 統合の方針（機械学習は対象外）に合わせて、e3fd0a1 の AI 関連ファイルと、AI のためだけの「動画の特徴」の保存を削除 |
+| b46790a | kdt26aie40003-oss ブランチの Web 版（`web/`、Codex で作成）を取り込み。ブランチの機械学習・プロファイル（3979bd4・892e56d）は取り込まない |
+| （このコミット） | e3fd0a1 で入った、使われていない動画の圧縮処理を media.py から削除（「取り込まなかったもの」の方針どおり）。README と発表資料を更新 |
+
+Web 版とデスクトップ版の違いは README の「Web 版」を参照。
+
+### テスト結果（2026-11-09、Windows 11、Python 3.14.3、PySide6 6.12.0、FFmpeg なし）
+
+- `pytest tests`: 197 passed, 16 skipped（スキップの内訳は上と同じ）
+- `python -m unittest discover -s tests`: 213 件 OK（16 skipped）
+- `test_review_fixes.py::InstanceLockTest::test_second_app_instance_exits_without_touching_data` は、
+  実行するたびに成功したり失敗したりする（6 回中 2〜3 回失敗）。後片付けで一時フォルダの instance.lock を消すときに
+  WinError 32（ほかのプロセスが使用中）になる。今回の変更より前の 2892fe4 でも同じように起きる
+- Web 版（`web/`）には自動テストがない
+
 ## 未検証・既知の制限
 
 - FFmpeg を使う判定（長さ・黒画面・無音・類似録画・サムネイル）は、この PC に FFmpeg がないため自動テストで未実行
@@ -51,3 +73,5 @@
 - 内蔵ドライブ全体の調査は、ファイル数が多いと時間がかかる（3,000 件のテストは数秒）。実際の大容量ドライブでの所要時間は未計測
 - `packaging/build_windows.bat` が使う `packaging/recsort.spec` はリポジトリにない（.gitignore で除外されている）
 - `tools/stress/` のストレス試験は Linux 向けで、今回は実行していない（参照先だけ新しい画面構成に合わせた）
+- Web 版の `web/dist/RecSort-PC.zip`（ビルド済みの exe）が `web/companion/Scan.cs` から作られたものかは確認していない
+- Web 版の `index.html` をファイルとして開いたときのダウンロード先は外部の公開ページ（`*.chatgpt.site`）で、リポジトリの管理外
