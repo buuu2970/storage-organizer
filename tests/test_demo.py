@@ -81,6 +81,57 @@ class DemoTest(unittest.TestCase):
         self.assertGreaterEqual(demo.remove(report=lambda m: None), 10)
         self.assertFalse(demo.exists())
 
+    @unittest.skipUnless(FFMPEG.available, "FFmpeg がありません")
+    def test_make_from_school_clips_shows_every_reason(self):
+        """ChatGPT などで作った学校生活の動画（素材）からデモを作り、実際に調べて理由を確認する。"""
+        import subprocess
+        from storage_organizer import candidates
+        src = demo.source_dir()
+        src.mkdir(parents=True)
+
+        def clip(name, vsrc, sec, audio=True):
+            args = [FFMPEG.ffmpeg, "-v", "error", "-f", "lavfi", "-i", vsrc]
+            if audio:
+                args += ["-f", "lavfi", "-i", "sine=f=440"]
+            args += ["-t", str(sec), "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+            args += ["-c:a", "aac", "-shortest"] if audio else []
+            subprocess.run(args + [str(src / name)], check=True)
+        clip("math_class.mp4", "testsrc2=s=320x180:r=30", 8, audio=False)  # 音のない素材 → 環境音を足す
+        clip("online_lecture.mp4", "mandelbrot=s=320x180:r=30", 8)
+        clip("night_school.mp4", "testsrc=s=320x180:r=30", 6)  # 明るい素材 → 暗くする
+        clip("presentation_mistake.mp4", "testsrc=s=320x180:r=30", 5)
+        clip("library_timelapse.mp4", "life=s=320x180:r=30", 6, audio=False)
+        clip("school_festival.mp4", "testsrc2=s=320x180:r=30,hue=h=90", 6)
+        self.assertTrue(demo.has_sources())
+        files = demo.make(FFMPEG, report=lambda m: None)
+        names = {p.name for p in files}
+        self.assertIn("数学の授業_第3回 (コピー).mp4", names)
+        self.assertNotIn("配信_真っ暗.mp4", names)  # 合成の録画は作らない
+        db = Store(self.base / "data")
+        try:
+            db.set_json_list("demo_locations", [str(p) for p in demo.demo_roots().values()])
+            from storage_organizer import autoscan as a
+            result = a.task_autoscan(db, FFMPEG, a.Controller(), lambda p: None)
+            self.assertFalse(result["cancelled"], result)
+            ctx = candidates.Context(db)
+            reasons = {r["name"]: ctx.short_reasons(r) for r in ctx.rows.values()}
+        finally:
+            db.close()
+        self.assertEqual(len(reasons), len(files))  # デモのフォルダの録画だけ（素材のフォルダは調べない）
+        def has(name, word):
+            self.assertTrue(any(word in r for r in reasons[name]), (name, reasons[name]))
+        has("数学の授業_第3回 (1).mp4", "重複")
+        has("数学の授業_第3回_低画質.mp4", "類似")
+        has("オンライン授業_再圧縮.mp4", "類似")
+        has("夜の校舎.mp4", "黒画面")
+        has("発表練習_録画ミス.mp4", "短い")
+        has("図書室_タイムラプス.mp4", "無音")
+        has("壊れた録画.mp4", "再生不可")
+        self.assertFalse(any("無音" in r for r in reasons["数学の授業_第3回.mp4"]))  # 足した環境音で無音にならない
+        self.assertEqual(reasons["文化祭の準備.ts"], [])
+        self.assertGreaterEqual(demo.remove(report=lambda m: None), len(files))
+        self.assertTrue((src / "math_class.mp4").exists())  # 素材は消さない
+
 
 @unittest.skipUnless(FFMPEG.available, "FFmpeg がありません")
 class TransportStreamTest(unittest.TestCase):

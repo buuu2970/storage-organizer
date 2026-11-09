@@ -86,6 +86,9 @@
 - `storage_organizer/demo.py`・`python main.py --demo`: 授業の発表用に、FFmpeg の合成映像だけでデモの録画 12 本を
   ビデオ・デスクトップ・ダウンロード・ドキュメントの「RecSortデモ」に作り、保存先を分けてそれだけを調べる
   （設定 `demo_locations`）。`--remove-demo` はデモで作ったファイルだけを消す。tests/test_demo.py
+- 素材（ダウンロード\RecSort素材 の学校生活の動画。ChatGPT で作る予定）があればそれを元にデモを作る。
+  重複・似た録画・短い・暗い・無音・.ts・壊れた録画はプログラムが作る。素材から作って実際に調べ、すべての理由が出ることを
+  テストで確認（test_make_from_school_clips_shows_every_reason）。素材は消さない
 - デモで見つけた不具合: テレビ録画などの .ts で、位置へ飛んでから読む方法（-ss を -i の前）だと1コマも取れず、
   「読み込み失敗」になっていた。取れなかったときは先頭から読む方法でやり直す（media.run_at）。場面・音量・サムネイル・
   比較画像・似た録画の判定のすべてに適用。TransportStreamTest
